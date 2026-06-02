@@ -13,6 +13,7 @@ app.use(cors({
 
 app.use(express.json());
 
+// Database connection configuration
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
@@ -27,20 +28,55 @@ const pool = mysql.createPool({
   }
 });
 
-pool.query(`
-  CREATE TABLE IF NOT EXISTS loans (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    userId INT NOT NULL,
-    loanType VARCHAR(255) NOT NULL,
-    amount DECIMAL(10,2) NOT NULL,
-    status VARCHAR(50) DEFAULT 'pending',
-    createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )
-`, (err) => {
-  if (err) console.error("Error creating tables:", err);
-  else console.log("Database tables verified/created successfully.");
-});
+// Robust database table self-healing script
+const initializeDatabase = () => {
+  // 1. First, verify or create the 'users' table
+  pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      first_name VARCHAR(100) NOT NULL,
+      last_name VARCHAR(100) NOT NULL,
+      email VARCHAR(150) UNIQUE NOT NULL,
+      phone VARCHAR(50),
+      password VARCHAR(255) NOT NULL,
+      createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `, (err) => {
+    if (err) {
+      console.error("❌ Error verifying/creating users table:", err.message);
+    } else {
+      console.log("✅ Users table verified/created successfully.");
+      
+      // 2. Second, verify or create the 'loans' table matching all used endpoint columns
+      pool.query(`
+        CREATE TABLE IF NOT EXISTS loans (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          user_id INT NOT NULL,
+          loan_type VARCHAR(255) NOT NULL,
+          amount DECIMAL(10,2) NOT NULL,
+          payment_mode VARCHAR(100),
+          account_number VARCHAR(100),
+          status VARCHAR(50) DEFAULT 'pending',
+          date_applied TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+      `, (loanErr) => {
+        if (loanErr) {
+          console.error("❌ Error verifying/creating loans table:", loanErr.message);
+        } else {
+          console.log("✅ Loans table verified/created successfully.");
+        }
+      });
+    }
+  });
+};
 
+// Execute table check instantly when server boots up
+initializeDatabase();
+
+// --- API ENDPOINTS ---
+
+// User Sign-up Route
 app.post('/api/signup', async (req, res) => {
   console.log("👉 Registration request processing:", req.body);
   const { firstName, lastName, email, phone, password } = req.body;
@@ -72,6 +108,7 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
+// User Login Authentication Route
 app.post('/api/login', (req, res) => {
   console.log("👉 Verification tracking for account:", req.body.email);
   const { email, password } = req.body;
@@ -117,6 +154,7 @@ app.post('/api/login', (req, res) => {
   });
 });
 
+// New Loan Application Submission Route
 app.post('/api/loans', (req, res) => {
   console.log("👉 New Loan request processing:", req.body);
   const { userId, loanType, amount, paymentMode, accountNumber } = req.body;
@@ -150,9 +188,7 @@ app.post('/api/loans', (req, res) => {
   });
 });
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
-
+// Dashboard Information Fetching Route
 app.get('/api/dashboard-summary/:userId', (req, res) => {
   const userId = req.params.userId;
 
@@ -160,9 +196,9 @@ app.get('/api/dashboard-summary/:userId', (req, res) => {
     return res.status(400).json({ message: "User identification parameter missing." });
   }
 
-  // Query A: Calculate the dynamic total sum of all borrowed amounts for this user
   const totalBorrowedSql = "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ?";
   const userLoansHistorySql = "SELECT id, loan_type, amount, payment_mode, date_applied FROM loans WHERE user_id = ? ORDER BY date_applied DESC";
+  
   pool.query(totalBorrowedSql, [userId], (err, balanceResults) => {
     if (err) {
       console.error("❌ Error calculating aggregated totals:", err.message);
@@ -178,8 +214,11 @@ app.get('/api/dashboard-summary/:userId', (req, res) => {
       res.status(200).json({
         success: true,
         totalBorrowedBalance: parseFloat(calculatedTotal),
-        borrowedLoansList: historyResults // Array of all their active/past loan entries
+        borrowedLoansList: historyResults
       });
     });
   });
 });
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
