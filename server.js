@@ -26,6 +26,21 @@ const pool = mysql.createPool({
     rejectUnauthorized: false
   }
 });
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS loans (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    userId INT NOT NULL,
+    loanType VARCHAR(255) NOT NULL,
+    amount DECIMAL(10,2) NOT NULL,
+    status VARCHAR(50) DEFAULT 'pending',
+    createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )
+`, (err) => {
+  if (err) console.error("Error creating tables:", err);
+  else console.log("Database tables verified/created successfully.");
+});
+
 app.post('/api/signup', async (req, res) => {
   console.log("👉 Registration request processing:", req.body);
   const { firstName, lastName, email, phone, password } = req.body;
