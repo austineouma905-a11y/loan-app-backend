@@ -13,7 +13,6 @@ app.use(cors({
 
 app.use(express.json());
 
-// Database connection configuration
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
@@ -28,7 +27,6 @@ const pool = mysql.createPool({
   }
 });
 
-// Robust database table self-healing script
 const initializeDatabase = () => {
   // 1. First, verify or create the 'users' table
   pool.query(`
@@ -47,24 +45,33 @@ const initializeDatabase = () => {
     } else {
       console.log("✅ Users table verified/created successfully.");
       
-      // 2. Second, verify or create the 'loans' table matching all used endpoint columns
-      pool.query(`
-        CREATE TABLE IF NOT EXISTS loans (
-          id INT AUTO_INCREMENT PRIMARY KEY,
-          user_id INT NOT NULL,
-          loan_type VARCHAR(255) NOT NULL,
-          amount DECIMAL(10,2) NOT NULL,
-          payment_mode VARCHAR(100),
-          account_number VARCHAR(100),
-          status VARCHAR(50) DEFAULT 'pending',
-          date_applied TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-      `, (loanErr) => {
-        if (loanErr) {
-          console.error("❌ Error verifying/creating loans table:", loanErr.message);
+      // Temporary: Drop the old, broken loans table so it can be rebuilt cleanly
+      pool.query(`DROP TABLE IF EXISTS loans`, (dropErr) => {
+        if (dropErr) {
+          console.error("❌ Error dropping old loans table:", dropErr.message);
         } else {
-          console.log("✅ Loans table verified/created successfully.");
+          console.log("⚠️ Old loans table dropped for schema migration.");
+
+          // 2. Re-create the 'loans' table with all matching columns
+          pool.query(`
+            CREATE TABLE IF NOT EXISTS loans (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              user_id INT NOT NULL,
+              loan_type VARCHAR(255) NOT NULL,
+              amount DECIMAL(10,2) NOT NULL,
+              payment_mode VARCHAR(100),
+              account_number VARCHAR(100),
+              status VARCHAR(50) DEFAULT 'pending',
+              date_applied TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+          `, (loanErr) => {
+            if (loanErr) {
+              console.error("❌ Error verifying/creating loans table:", loanErr.message);
+            } else {
+              console.log("✅ New loans table built with correct columns successfully!");
+            }
+          });
         }
       });
     }
