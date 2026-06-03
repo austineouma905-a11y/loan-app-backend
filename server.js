@@ -2,6 +2,7 @@ const express = require('express');
 const mysql = require('mysql2');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
+const mpesaRoutes = require('./mpesa');
 require('dotenv').config();
 
 const app = express();
@@ -28,7 +29,7 @@ const pool = mysql.createPool({
 });
 
 const initializeDatabase = () => {
-  // 1. First, verify or create the 'users' table
+  // 1. Attempt to handle Users Table
   pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -42,48 +43,43 @@ const initializeDatabase = () => {
   `, (err) => {
     if (err) {
       console.error("❌ Error verifying/creating users table:", err.message);
+      console.log("⚠️ Continuing initialization of loans table despite users table failure...");
     } else {
       console.log("✅ Users table verified/created successfully.");
-      
-      // Temporary: Drop the old, broken loans table so it can be rebuilt cleanly
-      pool.query(`DROP TABLE IF EXISTS loans`, (dropErr) => {
-        if (dropErr) {
-          console.error("❌ Error dropping old loans table:", dropErr.message);
-        } else {
-          console.log("⚠️ Old loans table dropped for schema migration.");
-
-          // 2. Re-create the 'loans' table with all matching columns
-          pool.query(`
-            CREATE TABLE IF NOT EXISTS loans (
-              id INT AUTO_INCREMENT PRIMARY KEY,
-              user_id INT NOT NULL,
-              loan_type VARCHAR(255) NOT NULL,
-              amount DECIMAL(10,2) NOT NULL,
-              payment_mode VARCHAR(100),
-              account_number VARCHAR(100),
-              status VARCHAR(50) DEFAULT 'pending',
-              date_applied TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            )
-          `, (loanErr) => {
-            if (loanErr) {
-              console.error("❌ Error verifying/creating loans table:", loanErr.message);
-            } else {
-              console.log("✅ New loans table built with correct columns successfully!");
-            }
-          });
-        }
-      });
     }
+
+    // 2. Separate Loans Table Logic so it runs even if connection is shaky
+    pool.query(`DROP TABLE IF EXISTS loans`, (dropErr) => {
+      if (dropErr) {
+        console.error("❌ Error dropping old loans table:", dropErr.message);
+      } else {
+        console.log("⚠️ Old loans table dropped for schema migration.");
+        pool.query(`
+          CREATE TABLE IF NOT EXISTS loans (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id INT NOT NULL,
+            loan_type VARCHAR(255) NOT NULL,
+            amount DECIMAL(10,2) NOT NULL,
+            payment_mode VARCHAR(100),
+            account_number VARCHAR(100),
+            status VARCHAR(50) DEFAULT 'pending',
+            date_applied TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+          )
+        `, (loanErr) => {
+          if (loanErr) {
+            console.error("❌ Error verifying/creating loans table:", loanErr.message);
+          } else {
+            console.log("✅ New loans table built with correct columns successfully!");
+          }
+        });
+      }
+    });
   });
 };
 
-// Execute table check instantly when server boots up
 initializeDatabase();
-
-// --- API ENDPOINTS ---
-
-// User Sign-up Route
+app.use('/api/mpesa', mpesaRoutes); // Mount MPESA routes
 app.post('/api/signup', async (req, res) => {
   console.log("👉 Registration request processing:", req.body);
   const { firstName, lastName, email, phone, password } = req.body;
@@ -114,8 +110,6 @@ app.post('/api/signup', async (req, res) => {
     res.status(500).json({ message: "Error securing your account profile information." });
   }
 });
-
-// User Login Authentication Route
 app.post('/api/login', (req, res) => {
   console.log("👉 Verification tracking for account:", req.body.email);
   const { email, password } = req.body;
@@ -160,8 +154,6 @@ app.post('/api/login', (req, res) => {
     });
   });
 });
-
-// New Loan Application Submission Route
 app.post('/api/loans', (req, res) => {
   console.log("👉 New Loan request processing:", req.body);
   const { userId, loanType, amount, paymentMode, accountNumber } = req.body;
@@ -194,8 +186,6 @@ app.post('/api/loans', (req, res) => {
     });
   });
 });
-
-// Dashboard Information Fetching Route
 app.get('/api/dashboard-summary/:userId', (req, res) => {
   const userId = req.params.userId;
 
