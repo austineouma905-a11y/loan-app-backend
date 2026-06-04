@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const router = express.Router();
+require('dotenv').config();
 const pool = require('./server'); 
 
 const getMpesaToken = async (req, res, next) => {
@@ -22,11 +23,15 @@ const getMpesaToken = async (req, res, next) => {
   }
 };
 router.post('/stkpush', getMpesaToken, async (req, res) => {
+  console.log("DEBUG KEYS:", process.env.MPESA_CONSUMER_KEY ? "EXISTS" : "MISSING");
+  console.log("DEBUG KEYS:", process.env.MPESA_CONSUMER_SECRET ? "EXISTS" : "MISSING");
+  console.log("DEBUG KEYS:", process.env.MPESA_PASSKEY ? "EXISTS" : "MISSING");
+  console.log("DEBUG KEYS:", process.env.MPESA_SHORTCODE ? "EXISTS" : "MISSING");
   const { phoneNumber, amount, userId, accountReference, transactionDesc } = req.body; 
   const token = req.mpesaToken;
 
-  if (!userId) {
-    return res.status(400).json({ error: "Missing identifying userId parameter" });
+  if (!accountReference) {
+    return res.status(400).json({ error: "Missing identifying accountReference parameter" });
   }
 
   let formattedPhone = phoneNumber.trim().replace(/\s+/g, '');
@@ -65,10 +70,10 @@ router.post('/stkpush', getMpesaToken, async (req, res) => {
     PartyB: shortCode,
     PhoneNumber: formattedPhone,
     CallBackURL: finalCallbackUrl, 
-    AccountReference: accountReference || `UID-${userId}`, // <--- Custom payload update
-    TransactionDesc: transactionDesc || "Loan Settlement Portal" // <--- Custom payload update
+    AccountReference: accountReference ,
+    TransactionDesc: transactionDesc || "Loan Settlement Portal"
   };
-
+console.log("📤 Prepared STK Push Payload:", stkPayload);
   try {
     console.log(`🚀 Dispatching STK Push to ${formattedPhone} for KES ${stkPayload.Amount}...`);
     const response = await axios.post(

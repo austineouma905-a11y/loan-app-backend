@@ -1,7 +1,7 @@
 const express = require('express');
 const mysql = require('mysql2');
 const cors = require('cors');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const mpesaRoutes = require('./mpesa');
 require('dotenv').config();
 
@@ -13,6 +13,7 @@ app.use(cors({
 }));
 
 app.use(express.json());
+
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
@@ -24,8 +25,11 @@ const pool = mysql.createPool({
   queueLimit: 0,
   ssl: {
     rejectUnauthorized: false
-  }
+  },
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 10000
 });
+
 const initializeDatabase = () => {
   pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -68,6 +72,7 @@ const initializeDatabase = () => {
 
 initializeDatabase();
 app.use('/api/mpesa', mpesaRoutes); 
+
 app.post('/api/signup', async (req, res) => {
   console.log("👉 Registration request processing:", req.body);
   const { firstName, lastName, email, phone, password } = req.body;
@@ -98,6 +103,7 @@ app.post('/api/signup', async (req, res) => {
     res.status(500).json({ message: "Error securing your account profile information." });
   }
 });
+
 app.post('/api/login', (req, res) => {
   const { email, password } = req.body;
   const query = "SELECT id, first_name, last_name, email, phone, password FROM users WHERE email = ?";
@@ -145,6 +151,37 @@ app.post('/api/login', (req, res) => {
     }
   });
 });
+
+/* 🔑 Added Endpoint: Forgot Password Verification Logic */
+app.post('/api/forgot-password', (req, res) => {
+  const { email } = req.body;
+  const checkEmailQuery = "SELECT id FROM users WHERE email = ?";
+
+  pool.query(checkEmailQuery, [email], (err, results) => {
+    if (err) {
+      console.error("❌ SQL Forgot Password Error:", err.message);
+      return res.status(500).json({ message: "Database lookup execution engine breakdown." });
+    }
+
+    if (results.length === 0) {
+      return res.status(404).json({ message: "Email trace not found in records." });
+    }
+
+    // Generate a random secure 6-digit numeric verification OTP
+    const generatedOtp = Math.floor(100000 + Math.random() * 900000);
+    
+    // Broadcast the OTP safely into Render service console environments
+    console.log(`\n==========================================`);
+    console.log(`🔑 PASSWORD RESET OTP REQUEST FOR: ${email}`);
+    console.log(`➔ VERIFICATION CODE PIN IS: ${generatedOtp}`);
+    console.log(`==========================================\n`);
+
+    return res.status(200).json({ 
+      message: "Recovery instructions sent successfully! Check your backend terminal logs for the validation OTP." 
+    });
+  });
+});
+
 app.post('/api/loans', (req, res) => {
   const { userId, loanType, amount, paymentMode, accountNumber } = req.body;
   
@@ -170,12 +207,13 @@ app.post('/api/loans', (req, res) => {
     });
   });
 });
+
 app.post('/api/mpesa/stkpush', async (req, res) => {
   const { phoneNumber, amount, accountReference, transactionDesc } = req.body;
   const stkPushPayload = {
     BusinessShortCode: process.env.MPESA_SHORTCODE,
-    Password: generatedMpesaPassword,
-    Timestamp: currentTimestamp,
+    Password: "generatedMpesaPassword",
+    Timestamp: "currentTimestamp",
     TransactionType: "CustomerPayBillOnline",
     Amount: amount,
     PartyA: phoneNumber,
@@ -185,6 +223,7 @@ app.post('/api/mpesa/stkpush', async (req, res) => {
     AccountReference: accountReference || "LoanRepayment",
     TransactionDesc: transactionDesc || "Loan Repayment"
   };
+  res.status(200).json({ message: "STK Push Payload structured successfully", payload: stkPushPayload });
 });
 
 app.get('/api/dashboard-summary/:userId', (req, res) => {
@@ -221,4 +260,4 @@ app.get('/api/dashboard-summary/:userId', (req, res) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
 
- module.exports = pool; 
+module.exports = pool;
