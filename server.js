@@ -14,6 +14,7 @@ app.use(cors({
 
 app.use(express.json());
 
+// 🗄️ DATABASE CONNECTION POOL
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
@@ -28,6 +29,7 @@ const pool = mysql.createPool({
   }
 });
 
+// 🛠️ DATABASE INITIALIZATION
 const initializeDatabase = () => {
   pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -47,6 +49,7 @@ const initializeDatabase = () => {
       console.log("✅ Users table verified/created successfully.");
     }
 
+    // Dropping and re-creating loans table to match dynamic updates cleanly
     pool.query(`DROP TABLE IF EXISTS loans`, (dropErr) => {
       if (dropErr) {
         console.error("❌ Error dropping old loans table:", dropErr.message);
@@ -77,7 +80,11 @@ const initializeDatabase = () => {
 };
 
 initializeDatabase();
-app.use('/api/mpesa', mpesaRoutes); // Mount MPESA routes
+
+// 📲 MOUNT DARADA M-PESA ROUTES
+app.use('/api/mpesa', mpesaRoutes); 
+
+// 📝 SIGNUP ROUTE
 app.post('/api/signup', async (req, res) => {
   console.log("👉 Registration request processing:", req.body);
   const { firstName, lastName, email, phone, password } = req.body;
@@ -108,29 +115,12 @@ app.post('/api/signup', async (req, res) => {
     res.status(500).json({ message: "Error securing your account profile information." });
   }
 });
+
+// 🔑 CLEANED & FIXED LOGIN ROUTE (Calculates real balances from loans table)
 app.post('/api/login', (req, res) => {
-    const { email, password } = req.body;
-    const query = "SELECT id, firstName, lastName, email, phone, loanId, loanBalance FROM users WHERE email = ? AND password = ?";
+  const { email, password } = req.body;
+  const query = "SELECT id, first_name, last_name, email, phone, password FROM users WHERE email = ?";
     
-    db.query(query, [email, password], (err, results) => {
-        if (err) return res.status(500).json({ message: "Database error" });
-        
-        if (results.length > 0) {
-            const user = results[0];
-            return res.status(200).json({
-                userId: user.id,
-                name: `${user.firstName} ${user.lastName}`,
-                email: user.email,
-                phone: user.phone,
-                loanId: user.loanId,
-                loanBalance: user.loanBalance
-            });
-        } else {
-            return res.status(401).json({ message: "Invalid credentials" });
-        }
-    });
-});
-  
   pool.query(query, [email], async (err, results) => {
     if (err) {
       console.error("❌ SQL Authentication Error:", err.message);
@@ -147,7 +137,8 @@ app.post('/api/login', (req, res) => {
       return res.status(401).json({ message: 'Invalid username or password!' });
     }
 
-    const balanceQuery = 'SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ?';
+    // Fetch up-to-date loan balance automatically from the loans table entries
+    const balanceQuery = "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status = 'Disbursed'";
     
     pool.query(balanceQuery, [user.id], (balanceErr, balanceResults) => {
       if (balanceErr) {
@@ -168,28 +159,39 @@ app.post('/api/login', (req, res) => {
       });
     });
   });
-app.post('/api/loans', (req, res) => {
-    const { userId, loanType, amount, paymentMode, accountNumber } = req.body;
-    const insertLoanQuery = "INSERT INTO loans (user_id, type, amount, status) VALUES (?, ?, ?, 'Disbursed')";
-    
-    db.query(insertLoanQuery, [userId, loanType, amount], (err, result) => {
-        if (err) return res.status(500).json({ message: "Failed to record loan" });
-        const updateUserBalanceQuery = "UPDATE users SET loanBalance = loanBalance + ? WHERE id = ?";
-        
-        db.query(updateUserBalanceQuery, [amount, userId], (err, updateResult) => {
-            if (err) return res.status(500).json({ message: "Failed to update user balance" });
-            const getNewBalanceQuery = "SELECT loanBalance FROM users WHERE id = ?";
-            db.query(getNewBalanceQuery, [userId], (err, balanceResult) => {
-                
-                const newTotalBalance = balanceResult[0].loanBalance;
-                return res.status(200).json({
-                    message: "Loan processed successfully",
-                    newTotalBalance: newTotalBalance
-                });
-            });
-        });
-    });
 });
+
+// 💰 FIXED LOANS APPLICATION ROUTE
+app.post('/api/loans', (req, res) => {
+  const { userId, loanType, amount, paymentMode, accountNumber } = req.body;
+  
+  // Notice column names match your created table: user_id, loan_type, amount, payment_mode, account_number, status
+  const insertLoanQuery = "INSERT INTO loans (user_id, loan_type, amount, payment_mode, account_number, status) VALUES (?, ?, ?, ?, ?, 'Disbursed')";
+    
+  pool.query(insertLoanQuery, [userId, loanType, amount, paymentMode, accountNumber], (err, result) => {
+    if (err) {
+      console.error("❌ SQL Insert Loan Error:", err.message);
+      return res.status(500).json({ message: "Failed to record loan" });
+    }
+
+    // Instantly calculate the fresh new balance to give right back to your frontend state
+    const getNewBalanceQuery = "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status = 'Disbursed'";
+    pool.query(getNewBalanceQuery, [userId], (balanceErr, balanceResult) => {
+      if (balanceErr) {
+        console.error("❌ SQL Fetching New Balance Error:", balanceErr.message);
+        return res.status(500).json({ message: "Loan saved, but failed to fetch updated balance details." });
+      }
+
+      const newTotalBalance = balanceResult[0].total_balance || 0;
+      return res.status(200).json({
+        message: "Loan processed successfully",
+        newTotalBalance: parseFloat(newTotalBalance)
+      });
+    });
+  });
+});
+
+// 📊 DASHBOARD SUMMARY ROUTE
 app.get('/api/dashboard-summary/:userId', (req, res) => {
   const userId = req.params.userId;
 
@@ -197,8 +199,8 @@ app.get('/api/dashboard-summary/:userId', (req, res) => {
     return res.status(400).json({ message: "User identification parameter missing." });
   }
 
-  const totalBorrowedSql = "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ?";
-  const userLoansHistorySql = "SELECT id, loan_type, amount, payment_mode, date_applied FROM loans WHERE user_id = ? ORDER BY date_applied DESC";
+  const totalBorrowedSql = "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status = 'Disbursed'";
+  const userLoansHistorySql = "SELECT id, loan_type, amount, payment_mode, status, date_applied FROM loans WHERE user_id = ? ORDER BY date_applied DESC";
   
   pool.query(totalBorrowedSql, [userId], (err, balanceResults) => {
     if (err) {
