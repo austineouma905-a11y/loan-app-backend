@@ -13,14 +13,11 @@ app.use(cors({
 }));
 
 app.use(express.json());
-
-// 🗄️ DATABASE CONNECTION POOL
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD, 
   database: process.env.DB_NAME,
-  // 💡 Convert port string to base-10 integer immediately to guarantee Aiven doesn't drop connections
   port: parseInt(process.env.DB_PORT, 10) || 24231, 
   waitForConnections: true,
   connectionLimit: 10,
@@ -29,8 +26,6 @@ const pool = mysql.createPool({
     rejectUnauthorized: false
   }
 });
-
-// 🛠️ SAFE DATABASE INITIALIZATION (Data-Preserving)
 const initializeDatabase = () => {
   pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -49,8 +44,6 @@ const initializeDatabase = () => {
     } else {
       console.log("✅ Users table verified/created successfully.");
     }
-
-    // 💡 REMOVED 'DROP TABLE IF EXISTS loans' TO PREVENT DATA WIPES ON SERVER REBOOTS
     pool.query(`
       CREATE TABLE IF NOT EXISTS loans (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -74,11 +67,7 @@ const initializeDatabase = () => {
 };
 
 initializeDatabase();
-
-// 📲 MOUNT DARAJA M-PESA ROUTES
 app.use('/api/mpesa', mpesaRoutes); 
-
-// 📝 SIGNUP ROUTE
 app.post('/api/signup', async (req, res) => {
   console.log("👉 Registration request processing:", req.body);
   const { firstName, lastName, email, phone, password } = req.body;
@@ -109,8 +98,6 @@ app.post('/api/signup', async (req, res) => {
     res.status(500).json({ message: "Error securing your account profile information." });
   }
 });
-
-// 🔑 LOGIN ROUTE (Safe Multi-Query Evaluation)
 app.post('/api/login', (req, res) => {
   const { email, password } = req.body;
   const query = "SELECT id, first_name, last_name, email, phone, password FROM users WHERE email = ?";
@@ -132,8 +119,6 @@ app.post('/api/login', (req, res) => {
       if (!match) { 
         return res.status(401).json({ message: 'Invalid username or password!' });
       }
-
-      // Fetch up-to-date loan balance automatically from the loans table entries
       const balanceQuery = "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status = 'Disbursed'";
       
       pool.query(balanceQuery, [user.id], (balanceErr, balanceResults) => {
@@ -160,8 +145,6 @@ app.post('/api/login', (req, res) => {
     }
   });
 });
-
-// 💰 LOANS APPLICATION ROUTE
 app.post('/api/loans', (req, res) => {
   const { userId, loanType, amount, paymentMode, accountNumber } = req.body;
   
@@ -172,8 +155,6 @@ app.post('/api/loans', (req, res) => {
       console.error("❌ SQL Insert Loan Error:", err.message);
       return res.status(500).json({ message: "Failed to record loan" });
     }
-
-    // Instantly calculate the fresh new balance to give right back to your frontend state
     const getNewBalanceQuery = "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status = 'Disbursed'";
     pool.query(getNewBalanceQuery, [userId], (balanceErr, balanceResult) => {
       if (balanceErr) {
@@ -189,8 +170,23 @@ app.post('/api/loans', (req, res) => {
     });
   });
 });
+app.post('/api/mpesa/stkpush', async (req, res) => {
+  const { phoneNumber, amount, accountReference, transactionDesc } = req.body;
+  const stkPushPayload = {
+    BusinessShortCode: process.env.MPESA_SHORTCODE,
+    Password: generatedMpesaPassword,
+    Timestamp: currentTimestamp,
+    TransactionType: "CustomerPayBillOnline",
+    Amount: amount,
+    PartyA: phoneNumber,
+    PartyB: process.env.MPESA_SHORTCODE,
+    PhoneNumber: phoneNumber,
+    CallBackURL: process.env.MPESA_CALLBACK_URL,
+    AccountReference: accountReference || "LoanRepayment",
+    TransactionDesc: transactionDesc || "Loan Repayment"
+  };
+});
 
-// 📊 DASHBOARD SUMMARY ROUTE
 app.get('/api/dashboard-summary/:userId', (req, res) => {
   const userId = req.params.userId;
 
@@ -224,3 +220,5 @@ app.get('/api/dashboard-summary/:userId', (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+
+ module.exports = pool; 
