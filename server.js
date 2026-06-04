@@ -14,7 +14,7 @@ app.use(cors({
 
 app.use(express.json());
 
-// In-memory global store to hold validation OTP codes temporarily
+// In-memory runtime data structure to cache security OTP configurations safely
 const otpVerificationStore = new Map();
 
 const pool = mysql.createPool({
@@ -47,6 +47,7 @@ const initializeDatabase = () => {
   `, (err) => {
     if (err) {
       console.error("❌ Error verifying/creating users table:", err.message);
+      console.log("⚠️ Continuing initialization of loans table despite users table failure...");
     } else {
       console.log("✅ Users table verified/created successfully.");
     }
@@ -66,7 +67,7 @@ const initializeDatabase = () => {
       if (loanErr) {
         console.error("❌ Error verifying/creating loans table:", loanErr.message);
       } else {
-        console.log("✅ New loans table verified/built successfully!");
+        console.log("✅ New loans table verified/built with correct columns successfully!");
       }
     });
   });
@@ -76,19 +77,24 @@ initializeDatabase();
 app.use('/api/mpesa', mpesaRoutes); 
 
 app.post('/api/signup', async (req, res) => {
+  console.log("👉 Registration request processing:", req.body);
   const { firstName, lastName, email, phone, password } = req.body;
+  
   try {
     const saltRounds = 10;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
+
     const sql = "INSERT INTO users (first_name, last_name, email, phone, password) VALUES (?, ?, ?, ?, ?)";
     
     pool.query(sql, [firstName, lastName, email, phone, hashedPassword], (err, result) => {
       if (err) {
+        console.error("❌ SQL Registration Error:", err.message);
         if (err.code === 'ER_DUP_ENTRY') {
           return res.status(400).json({ message: "This email address is already registered!" });
         }
         return res.status(500).json({ message: "Internal server data persistence error." });
       }
+      
       res.status(201).json({ 
         message: "Account synchronized to MySQL successfully!",
         loanId: `LNX-2026-${result.insertId}`,
@@ -107,13 +113,16 @@ app.post('/api/login', (req, res) => {
     
   pool.query(query, [email], async (err, results) => {
     if (err) {
+      console.error("❌ SQL Authentication Error:", err.message);
       return res.status(500).json({ message: 'Database query execution failure.' });
     }
+
     if (results.length === 0) {
       return res.status(401).json({ message: 'Invalid username or password!' });
     }
 
     const user = results[0];
+    
     try {
       const match = await bcrypt.compare(password, user.password);
       if (!match) { 
@@ -123,9 +132,12 @@ app.post('/api/login', (req, res) => {
       
       pool.query(balanceQuery, [user.id], (balanceErr, balanceResults) => {
         if (balanceErr) {
+          console.error("❌ SQL Balance Query Error:", balanceErr.message);
           return res.status(500).json({ message: 'Failed to balance account summaries.' });
         }
+
         const currentBalance = balanceResults[0].total_balance || 0;
+
         res.status(200).json({
           message: 'Login authorized via MySQL!',
           name: `${user.first_name} ${user.last_name}`,
@@ -137,56 +149,61 @@ app.post('/api/login', (req, res) => {
         });
       });
     } catch (bcryptErr) {
+      console.error("❌ Bcrypt evaluation exception:", bcryptErr);
       return res.status(500).json({ message: "Profile access configuration error." });
     }
   });
 });
 
-/* 📡 Trigger 6-Digit Validation OTP via System Console Logs */
+/* 📡 Trigger Security OTP Broadcast Routing */
 app.post('/api/forgot-password', (req, res) => {
   const { email } = req.body;
   const checkEmailQuery = "SELECT id FROM users WHERE email = ?";
 
   pool.query(checkEmailQuery, [email], (err, results) => {
     if (err) {
-      return res.status(500).json({ message: "Database engine breakdown." });
+      console.error("❌ SQL Forgot Password Error:", err.message);
+      return res.status(500).json({ message: "Database lookup execution engine breakdown." });
     }
+
     if (results.length === 0) {
       return res.status(404).json({ message: "Email trace not found in records." });
     }
 
+    // Generate a random, unique 6-digit verification code string
     const generatedOtp = Math.floor(100000 + Math.random() * 900000).toString();
     
-    // Save generated token linked to this email address (Valid for 10 minutes)
+    // Save generated verification credentials to memory (Will expire in 10 minutes)
     otpVerificationStore.set(email, {
       code: generatedOtp,
       expiresAt: Date.now() + 10 * 60 * 1000
     });
     
+    // Output the security pin cleanly into Render/VS Code terminals
     console.log(`\n==============🔒 SYSTEM SECURITY DISPATCH 🔒==============`);
     console.log(`🔑 PASSWORD RESET REQUEST INITIATED FOR: ${email}`);
     console.log(`➔ YOUR VALIDATION OTP VERIFICATION CODE IS: [ ${generatedOtp} ]`);
     console.log(`==========================================================\n`);
 
     return res.status(200).json({ 
-      message: "Security code broadcasted successfully! Enter the OTP to finalize updates." 
+      message: "Recovery validation code dispatched successfully! Enter the OTP to authorize modifications." 
     });
   });
 });
 
-/* 🛠️ Verify the OTP and Commit New Password updates to MySQL */
+/* 🛠️ Verify OTP Security Matches and Commit Password Updates to MySQL */
 app.post('/api/reset-password-verify', async (req, res) => {
   const { email, otpCode, newPassword } = req.body;
-  const record = otpVerificationStore.get(email);
+  const sessionRecord = otpVerificationStore.get(email);
 
-  if (!record) {
+  if (!sessionRecord) {
     return res.status(400).json({ message: "No active verification session found for this user context." });
   }
-  if (Date.now() > record.expiresAt) {
+  if (Date.now() > sessionRecord.expiresAt) {
     otpVerificationStore.delete(email);
     return res.status(400).json({ message: "Verification session has expired. Request a new OTP." });
   }
-  if (record.code !== otpCode.trim()) {
+  if (sessionRecord.code !== otpCode.trim()) {
     return res.status(400).json({ message: "Invalid verification code sequence match failed." });
   }
 
@@ -197,31 +214,37 @@ app.post('/api/reset-password-verify', async (req, res) => {
 
     pool.query(updatePasswordSql, [newHashedPassword, email], (updateErr) => {
       if (updateErr) {
+        console.error("❌ SQL Reset Password Commit Failure:", updateErr.message);
         return res.status(500).json({ message: "Failed to persist new security configuration changes." });
       }
       
-      // Successfully consumed OTP
+      // Remove token from cache on successful database sync
       otpVerificationStore.delete(email);
-      return res.status(200).json({ message: "Credentials successfully updated inside MySQL!" });
+      return res.status(200).json({ message: "Password credentials successfully updated inside MySQL!" });
     });
-  } catch (ex) {
+  } catch (error) {
+    console.error("❌ Reset password hashing failure:", error);
     return res.status(500).json({ message: "System failure hashing password matrices safely." });
   }
 });
 
 app.post('/api/loans', (req, res) => {
   const { userId, loanType, amount, paymentMode, accountNumber } = req.body;
+  
   const insertLoanQuery = "INSERT INTO loans (user_id, loan_type, amount, payment_mode, account_number, status) VALUES (?, ?, ?, ?, ?, 'Disbursed')";
     
-  pool.query(insertLoanQuery, [userId, loanType, amount, paymentMode, accountNumber], (err) => {
+  pool.query(insertLoanQuery, [userId, loanType, amount, paymentMode, accountNumber], (err, result) => {
     if (err) {
+      console.error("❌ SQL Insert Loan Error:", err.message);
       return res.status(500).json({ message: "Failed to record loan" });
     }
     const getNewBalanceQuery = "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status = 'Disbursed'";
     pool.query(getNewBalanceQuery, [userId], (balanceErr, balanceResult) => {
       if (balanceErr) {
-        return res.status(500).json({ message: "Loan saved, but balance updates failed." });
+        console.error("❌ SQL Fetching New Balance Error:", balanceErr.message);
+        return res.status(500).json({ message: "Loan saved, but failed to fetch updated balance details." });
       }
+
       const newTotalBalance = balanceResult[0].total_balance || 0;
       return res.status(200).json({
         message: "Loan processed successfully",
@@ -231,18 +254,45 @@ app.post('/api/loans', (req, res) => {
   });
 });
 
+app.post('/api/mpesa/stkpush', async (req, res) => {
+  const { phoneNumber, amount, accountReference, transactionDesc } = req.body;
+  const stkPushPayload = {
+    BusinessShortCode: process.env.MPESA_SHORTCODE,
+    Password: "generatedMpesaPassword",
+    Timestamp: "currentTimestamp",
+    TransactionType: "CustomerPayBillOnline",
+    Amount: amount,
+    PartyA: phoneNumber,
+    PartyB: process.env.MPESA_SHORTCODE,
+    PhoneNumber: phoneNumber,
+    CallBackURL: process.env.MPESA_CALLBACK_URL,
+    AccountReference: accountReference || "LoanRepayment",
+    TransactionDesc: transactionDesc || "Loan Repayment"
+  };
+  res.status(200).json({ message: "STK Push Payload structured successfully", payload: stkPushPayload });
+});
+
 app.get('/api/dashboard-summary/:userId', (req, res) => {
   const userId = req.params.userId;
-  if (!userId) return res.status(400).json({ message: "User identification missing." });
+
+  if (!userId) {
+    return res.status(400).json({ message: "User identification parameter missing." });
+  }
 
   const totalBorrowedSql = "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status = 'Disbursed'";
   const userLoansHistorySql = "SELECT id, loan_type, amount, payment_mode, status, date_applied FROM loans WHERE user_id = ? ORDER BY date_applied DESC";
   
   pool.query(totalBorrowedSql, [userId], (err, balanceResults) => {
-    if (err) return res.status(500).json({ message: "Database execution failure." });
+    if (err) {
+      console.error("❌ Error calculating aggregated totals:", err.message);
+      return res.status(500).json({ message: "Database execution failure on total balance." });
+    }
 
     pool.query(userLoansHistorySql, [userId], (errHistory, historyResults) => {
-      if (errHistory) return res.status(500).json({ message: "Database execution failure." });
+      if (errHistory) {
+        console.error("❌ Error fetching loan logs:", errHistory.message);
+        return res.status(500).json({ message: "Database execution failure on history." });
+      }
       const calculatedTotal = balanceResults[0].total_balance || 0;
       res.status(200).json({
         success: true,
