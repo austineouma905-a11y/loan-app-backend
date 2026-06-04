@@ -13,10 +13,6 @@ app.use(cors({
 }));
 
 app.use(express.json());
-
-// In-memory runtime data structure to cache security OTP configurations safely
-const otpVerificationStore = new Map();
-
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
@@ -32,7 +28,6 @@ const pool = mysql.createPool({
   enableKeepAlive: true,
   keepAliveInitialDelay: 10000
 });
-
 const initializeDatabase = () => {
   pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -75,7 +70,6 @@ const initializeDatabase = () => {
 
 initializeDatabase();
 app.use('/api/mpesa', mpesaRoutes); 
-
 app.post('/api/signup', async (req, res) => {
   console.log("👉 Registration request processing:", req.body);
   const { firstName, lastName, email, phone, password } = req.body;
@@ -106,7 +100,6 @@ app.post('/api/signup', async (req, res) => {
     res.status(500).json({ message: "Error securing your account profile information." });
   }
 });
-
 app.post('/api/login', (req, res) => {
   const { email, password } = req.body;
   const query = "SELECT id, first_name, last_name, email, phone, password FROM users WHERE email = ?";
@@ -154,80 +147,6 @@ app.post('/api/login', (req, res) => {
     }
   });
 });
-
-/* 📡 Trigger Security OTP Broadcast Routing */
-app.post('/api/forgot-password', (req, res) => {
-  const { email } = req.body;
-  const checkEmailQuery = "SELECT id FROM users WHERE email = ?";
-
-  pool.query(checkEmailQuery, [email], (err, results) => {
-    if (err) {
-      console.error("❌ SQL Forgot Password Error:", err.message);
-      return res.status(500).json({ message: "Database lookup execution engine breakdown." });
-    }
-
-    if (results.length === 0) {
-      return res.status(404).json({ message: "Email trace not found in records." });
-    }
-
-    // Generate a random, unique 6-digit verification code string
-    const generatedOtp = Math.floor(100000 + Math.random() * 900000).toString();
-    
-    // Save generated verification credentials to memory (Will expire in 10 minutes)
-    otpVerificationStore.set(email, {
-      code: generatedOtp,
-      expiresAt: Date.now() + 10 * 60 * 1000
-    });
-    
-    // Output the security pin cleanly into Render/VS Code terminals
-    console.log(`\n==============🔒 SYSTEM SECURITY DISPATCH 🔒==============`);
-    console.log(`🔑 PASSWORD RESET REQUEST INITIATED FOR: ${email}`);
-    console.log(`➔ YOUR VALIDATION OTP VERIFICATION CODE IS: [ ${generatedOtp} ]`);
-    console.log(`==========================================================\n`);
-
-    return res.status(200).json({ 
-      message: "Recovery validation code dispatched successfully! Enter the OTP to authorize modifications." 
-    });
-  });
-});
-
-/* 🛠️ Verify OTP Security Matches and Commit Password Updates to MySQL */
-app.post('/api/reset-password-verify', async (req, res) => {
-  const { email, otpCode, newPassword } = req.body;
-  const sessionRecord = otpVerificationStore.get(email);
-
-  if (!sessionRecord) {
-    return res.status(400).json({ message: "No active verification session found for this user context." });
-  }
-  if (Date.now() > sessionRecord.expiresAt) {
-    otpVerificationStore.delete(email);
-    return res.status(400).json({ message: "Verification session has expired. Request a new OTP." });
-  }
-  if (sessionRecord.code !== otpCode.trim()) {
-    return res.status(400).json({ message: "Invalid verification code sequence match failed." });
-  }
-
-  try {
-    const saltRounds = 10;
-    const newHashedPassword = await bcrypt.hash(newPassword, saltRounds);
-    const updatePasswordSql = "UPDATE users SET password = ? WHERE email = ?";
-
-    pool.query(updatePasswordSql, [newHashedPassword, email], (updateErr) => {
-      if (updateErr) {
-        console.error("❌ SQL Reset Password Commit Failure:", updateErr.message);
-        return res.status(500).json({ message: "Failed to persist new security configuration changes." });
-      }
-      
-      // Remove token from cache on successful database sync
-      otpVerificationStore.delete(email);
-      return res.status(200).json({ message: "Password credentials successfully updated inside MySQL!" });
-    });
-  } catch (error) {
-    console.error("❌ Reset password hashing failure:", error);
-    return res.status(500).json({ message: "System failure hashing password matrices safely." });
-  }
-});
-
 app.post('/api/loans', (req, res) => {
   const { userId, loanType, amount, paymentMode, accountNumber } = req.body;
   
@@ -253,13 +172,12 @@ app.post('/api/loans', (req, res) => {
     });
   });
 });
-
 app.post('/api/mpesa/stkpush', async (req, res) => {
   const { phoneNumber, amount, accountReference, transactionDesc } = req.body;
   const stkPushPayload = {
     BusinessShortCode: process.env.MPESA_SHORTCODE,
-    Password: "generatedMpesaPassword",
-    Timestamp: "currentTimestamp",
+    Password: generatedMpesaPassword,
+    Timestamp: currentTimestamp,
     TransactionType: "CustomerPayBillOnline",
     Amount: amount,
     PartyA: phoneNumber,
@@ -269,7 +187,6 @@ app.post('/api/mpesa/stkpush', async (req, res) => {
     AccountReference: accountReference || "LoanRepayment",
     TransactionDesc: transactionDesc || "Loan Repayment"
   };
-  res.status(200).json({ message: "STK Push Payload structured successfully", payload: stkPushPayload });
 });
 
 app.get('/api/dashboard-summary/:userId', (req, res) => {
@@ -306,4 +223,4 @@ app.get('/api/dashboard-summary/:userId', (req, res) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
 
-module.exports = pool;
+ module.exports = pool; 
