@@ -29,7 +29,6 @@ const pool = mysql.createPool({
 });
 
 const initializeDatabase = () => {
-  // 1. Attempt to handle Users Table
   pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -48,7 +47,6 @@ const initializeDatabase = () => {
       console.log("✅ Users table verified/created successfully.");
     }
 
-    // 2. Separate Loans Table Logic so it runs even if connection is shaky
     pool.query(`DROP TABLE IF EXISTS loans`, (dropErr) => {
       if (dropErr) {
         console.error("❌ Error dropping old loans table:", dropErr.message);
@@ -111,10 +109,27 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 app.post('/api/login', (req, res) => {
-  console.log("👉 Verification tracking for account:", req.body.email);
-  const { email, password } = req.body;
-  
-  const query = 'SELECT id, first_name, last_name, email, phone, password FROM users WHERE email = ?';
+    const { email, password } = req.body;
+    const query = "SELECT id, firstName, lastName, email, phone, loanId, loanBalance FROM users WHERE email = ? AND password = ?";
+    
+    db.query(query, [email, password], (err, results) => {
+        if (err) return res.status(500).json({ message: "Database error" });
+        
+        if (results.length > 0) {
+            const user = results[0];
+            return res.status(200).json({
+                userId: user.id,
+                name: `${user.firstName} ${user.lastName}`,
+                email: user.email,
+                phone: user.phone,
+                loanId: user.loanId,
+                loanBalance: user.loanBalance
+            });
+        } else {
+            return res.status(401).json({ message: "Invalid credentials" });
+        }
+    });
+});
   
   pool.query(query, [email], async (err, results) => {
     if (err) {
@@ -153,38 +168,27 @@ app.post('/api/login', (req, res) => {
       });
     });
   });
-});
 app.post('/api/loans', (req, res) => {
-  console.log("👉 New Loan request processing:", req.body);
-  const { userId, loanType, amount, paymentMode, accountNumber } = req.body;
-
-  if (!userId || !loanType || !amount || !accountNumber) {
-    return res.status(400).json({ message: "Missing required loan verification metadata fields." });
-  }
-
-  const sql = "INSERT INTO loans (user_id, loan_type, amount, payment_mode, account_number) VALUES (?, ?, ?, ?, ?)";
-  pool.query(sql, [userId, loanType, amount, paymentMode, accountNumber], (err, result) => {
-    if (err) {
-      console.error("❌ SQL Loan Entry Error:", err.message);
-      return res.status(500).json({ message: "Failed to persist loan application request records." });
-    }
-    const sumSql = "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ?";
+    const { userId, loanType, amount, paymentMode, accountNumber } = req.body;
+    const insertLoanQuery = "INSERT INTO loans (user_id, type, amount, status) VALUES (?, ?, ?, 'Disbursed')";
     
-    pool.query(sumSql, [userId], (sumErr, sumResults) => {
-      if (sumErr) {
-        console.error("❌ SQL Sum Calculation Failure:", sumErr.message);
-        return res.status(500).json({ message: "Loan saved, but dashboard metrics tracking failed." });
-      }
-
-      const freshTotal = sumResults[0].total_balance || 0;
-      res.status(201).json({
-        message: "Loan submission completely locked into DB engines!",
-        applicationId: result.insertId,
-        status: "Disbursement In Progress",
-        newTotalBalance: parseFloat(freshTotal) 
-      });
+    db.query(insertLoanQuery, [userId, loanType, amount], (err, result) => {
+        if (err) return res.status(500).json({ message: "Failed to record loan" });
+        const updateUserBalanceQuery = "UPDATE users SET loanBalance = loanBalance + ? WHERE id = ?";
+        
+        db.query(updateUserBalanceQuery, [amount, userId], (err, updateResult) => {
+            if (err) return res.status(500).json({ message: "Failed to update user balance" });
+            const getNewBalanceQuery = "SELECT loanBalance FROM users WHERE id = ?";
+            db.query(getNewBalanceQuery, [userId], (err, balanceResult) => {
+                
+                const newTotalBalance = balanceResult[0].loanBalance;
+                return res.status(200).json({
+                    message: "Loan processed successfully",
+                    newTotalBalance: newTotalBalance
+                });
+            });
+        });
     });
-  });
 });
 app.get('/api/dashboard-summary/:userId', (req, res) => {
   const userId = req.params.userId;
