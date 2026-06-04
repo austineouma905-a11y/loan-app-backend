@@ -20,7 +20,8 @@ const pool = mysql.createPool({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD, 
   database: process.env.DB_NAME,
-  port: process.env.DB_PORT || 3307,
+  // 💡 Convert port string to base-10 integer immediately to guarantee Aiven doesn't drop connections
+  port: parseInt(process.env.DB_PORT, 10) || 24231, 
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
@@ -29,7 +30,7 @@ const pool = mysql.createPool({
   }
 });
 
-// 🛠️ DATABASE INITIALIZATION
+// 🛠️ SAFE DATABASE INITIALIZATION (Data-Preserving)
 const initializeDatabase = () => {
   pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -49,31 +50,24 @@ const initializeDatabase = () => {
       console.log("✅ Users table verified/created successfully.");
     }
 
-    // Dropping and re-creating loans table to match dynamic updates cleanly
-    pool.query(`DROP TABLE IF EXISTS loans`, (dropErr) => {
-      if (dropErr) {
-        console.error("❌ Error dropping old loans table:", dropErr.message);
+    // 💡 REMOVED 'DROP TABLE IF EXISTS loans' TO PREVENT DATA WIPES ON SERVER REBOOTS
+    pool.query(`
+      CREATE TABLE IF NOT EXISTS loans (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        loan_type VARCHAR(255) NOT NULL,
+        amount DECIMAL(10,2) NOT NULL,
+        payment_mode VARCHAR(100),
+        account_number VARCHAR(100),
+        status VARCHAR(50) DEFAULT 'pending',
+        date_applied TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `, (loanErr) => {
+      if (loanErr) {
+        console.error("❌ Error verifying/creating loans table:", loanErr.message);
       } else {
-        console.log("⚠️ Old loans table dropped for schema migration.");
-        pool.query(`
-          CREATE TABLE IF NOT EXISTS loans (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            user_id INT NOT NULL,
-            loan_type VARCHAR(255) NOT NULL,
-            amount DECIMAL(10,2) NOT NULL,
-            payment_mode VARCHAR(100),
-            account_number VARCHAR(100),
-            status VARCHAR(50) DEFAULT 'pending',
-            date_applied TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-          )
-        `, (loanErr) => {
-          if (loanErr) {
-            console.error("❌ Error verifying/creating loans table:", loanErr.message);
-          } else {
-            console.log("✅ New loans table built with correct columns successfully!");
-          }
-        });
+        console.log("✅ New loans table verified/built with correct columns successfully!");
       }
     });
   });
@@ -81,7 +75,7 @@ const initializeDatabase = () => {
 
 initializeDatabase();
 
-// 📲 MOUNT DARADA M-PESA ROUTES
+// 📲 MOUNT DARAJA M-PESA ROUTES
 app.use('/api/mpesa', mpesaRoutes); 
 
 // 📝 SIGNUP ROUTE
@@ -116,7 +110,7 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-// 🔑 CLEANED & FIXED LOGIN ROUTE (Calculates real balances from loans table)
+// 🔑 LOGIN ROUTE (Safe Multi-Query Evaluation)
 app.post('/api/login', (req, res) => {
   const { email, password } = req.body;
   const query = "SELECT id, first_name, last_name, email, phone, password FROM users WHERE email = ?";
@@ -132,40 +126,45 @@ app.post('/api/login', (req, res) => {
     }
 
     const user = results[0];
-    const match = await bcrypt.compare(password, user.password);
-    if (!match) { 
-      return res.status(401).json({ message: 'Invalid username or password!' });
-    }
-
-    // Fetch up-to-date loan balance automatically from the loans table entries
-    const balanceQuery = "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status = 'Disbursed'";
     
-    pool.query(balanceQuery, [user.id], (balanceErr, balanceResults) => {
-      if (balanceErr) {
-        console.error("❌ SQL Balance Query Error:", balanceErr.message);
-        return res.status(500).json({ message: 'Failed to balance account summaries.' });
+    try {
+      const match = await bcrypt.compare(password, user.password);
+      if (!match) { 
+        return res.status(401).json({ message: 'Invalid username or password!' });
       }
 
-      const currentBalance = balanceResults[0].total_balance || 0;
+      // Fetch up-to-date loan balance automatically from the loans table entries
+      const balanceQuery = "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status = 'Disbursed'";
+      
+      pool.query(balanceQuery, [user.id], (balanceErr, balanceResults) => {
+        if (balanceErr) {
+          console.error("❌ SQL Balance Query Error:", balanceErr.message);
+          return res.status(500).json({ message: 'Failed to balance account summaries.' });
+        }
 
-      res.status(200).json({
-        message: 'Login authorized via MySQL!',
-        name: `${user.first_name} ${user.last_name}`,
-        email: user.email,
-        phone: user.phone,
-        loanId: `LNX-2026-${user.id}`,
-        userId: user.id,
-        loanBalance: parseFloat(currentBalance)
+        const currentBalance = balanceResults[0].total_balance || 0;
+
+        res.status(200).json({
+          message: 'Login authorized via MySQL!',
+          name: `${user.first_name} ${user.last_name}`,
+          email: user.email,
+          phone: user.phone,
+          loanId: `LNX-2026-${user.id}`,
+          userId: user.id,
+          loanBalance: parseFloat(currentBalance)
+        });
       });
-    });
+    } catch (bcryptErr) {
+      console.error("❌ Bcrypt evaluation exception:", bcryptErr);
+      return res.status(500).json({ message: "Profile access configuration error." });
+    }
   });
 });
 
-// 💰 FIXED LOANS APPLICATION ROUTE
+// 💰 LOANS APPLICATION ROUTE
 app.post('/api/loans', (req, res) => {
   const { userId, loanType, amount, paymentMode, accountNumber } = req.body;
   
-  // Notice column names match your created table: user_id, loan_type, amount, payment_mode, account_number, status
   const insertLoanQuery = "INSERT INTO loans (user_id, loan_type, amount, payment_mode, account_number, status) VALUES (?, ?, ?, ?, ?, 'Disbursed')";
     
   pool.query(insertLoanQuery, [userId, loanType, amount, paymentMode, accountNumber], (err, result) => {

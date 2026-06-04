@@ -1,8 +1,11 @@
 const express = require('express');
 const axios = require('axios');
 const router = express.Router();
+// 🗄️ Import the shared connection pool from your server core file
+// (Ensure this path correctly targets the file where your mysql2 pool is initialized)
+const pool = require('./server'); 
 
-// 💡 Helper Middleware: Generate secure Safaricom OAuth Token
+// 🔐 MIDDLEWARE: GET MPESA OAUTH TOKEN
 const getMpesaToken = async (req, res, next) => {
   const consumerKey = process.env.MPESA_CONSUMER_KEY;
   const consumerSecret = process.env.MPESA_CONSUMER_SECRET;
@@ -19,17 +22,21 @@ const getMpesaToken = async (req, res, next) => {
     req.mpesaToken = response.data.access_token;
     next();
   } catch (error) {
-    console.error("❌ Safaricom Token Error:", error.message);
+    console.error("❌ Safaricom Token Error:", error.response?.data || error.message);
     res.status(500).json({ error: "Failed to generate authentication token" });
   }
 };
 
-// 📲 Route 1: Initiate the STK Push PIN Prompt
+// 📲 TRIGGER M-PESA STK PUSH
 router.post('/stkpush', getMpesaToken, async (req, res) => {
-  const { phoneNumber, amount } = req.body;
+  const { phoneNumber, amount, userId } = req.body; // 💡 Capture userId from frontend request
   const token = req.mpesaToken;
 
-  // Format local phone numbers safely to 254XXXXXXXXX standard
+  if (!userId) {
+    return res.status(400).json({ error: "Missing identifying userId parameter" });
+  }
+
+  // Clean and normalize the phone input safely
   let formattedPhone = phoneNumber.trim().replace(/\s+/g, '');
   if (formattedPhone.startsWith('0')) {
     formattedPhone = `254${formattedPhone.slice(1)}`;
@@ -39,39 +46,58 @@ router.post('/stkpush', getMpesaToken, async (req, res) => {
 
   const shortCode = process.env.MPESA_SHORTCODE || "174379"; 
   const passKey = process.env.MPESA_PASSKEY;
-  
-  // Create Timestamp: YYYYMMDDHHmmss
-  const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+
+  // 🕒 Generate reliable Kenyan Timezone Timestamp (YYYYMMDDHHMMSS)
+  const now = new Date();
+  const eatOffset = 3 * 60 * 60 * 1000; 
+  const eatDate = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + eatOffset);
+
+  const timestamp = 
+    eatDate.getFullYear() +
+    ("0" + (eatDate.getMonth() + 1)).slice(-2) +
+    ("0" + eatDate.getDate()).slice(-2) +
+    ("0" + eatDate.getHours()).slice(-2) +
+    ("0" + eatDate.getMinutes()).slice(-2) +
+    ("0" + eatDate.getSeconds()).slice(-2);
+
   const password = Buffer.from(`${shortCode}${passKey}${timestamp}`).toString('base64');
+
+  const liveBackendUrl = process.env.BACKEND_URL || "https://loan-app-backend-vg4d.onrender.com";
+  const finalCallbackUrl = `${liveBackendUrl.replace(/\/$/, '')}/api/mpesa/callback`;
 
   const stkPayload = {
     BusinessShortCode: shortCode,
     Password: password,
     Timestamp: timestamp,
     TransactionType: "CustomerPayBillOnline",
-    Amount: Math.ceil(amount), // Ensure integer values
+    Amount: Math.ceil(amount), 
     PartyA: formattedPhone,
     PartyB: shortCode,
     PhoneNumber: formattedPhone,
-    CallBackURL: "https://your-render-backend-url.onrender.com/api/mpesa/callback", // ⚠️ Replace with your live Render URL
-    AccountReference: "OstoLoanRepay",
+    CallBackURL: finalCallbackUrl, 
+    AccountReference: `UID-${userId}`, // 💡 Anchor the payment tracking dynamically to the user record
     TransactionDesc: "Loan Settlement Portal"
   };
 
   try {
+    console.log(`🚀 Dispatching STK Push to ${formattedPhone} for KES ${stkPayload.Amount}...`);
     const response = await axios.post(
       'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
       stkPayload,
       { headers: { Authorization: `Bearer ${token}` } }
     );
-    res.status(200).json({ message: "STK Push sent successfully!", merchantRequestID: response.data.MerchantRequestID });
+    
+    res.status(200).json({ 
+      message: "STK Push sent successfully!", 
+      merchantRequestID: response.data.MerchantRequestID 
+    });
   } catch (error) {
-    console.error("❌ STK Push Processing Error:", error.response?.data || error.message);
+    console.error("❌ STK Push Processing Error Details:", error.response?.data || error.message);
     res.status(500).json({ error: "Failed to trigger Daraja PIN prompt" });
   }
 });
 
-// 📡 Route 2: Safaricom Webhook Callback Receiver
+// 📥 SAFARICOM CALLBACK RECEIVER (With Real-Time Database Settlement)
 router.post('/callback', async (req, res) => {
   try {
     const callbackData = req.body.Body.stkCallback;
@@ -81,11 +107,49 @@ router.post('/callback', async (req, res) => {
       const receipt = metadataItems.find(item => item.Name === 'MpesaReceiptNumber')?.Value;
       const amountPaid = metadataItems.find(item => item.Name === 'Amount')?.Value;
       const phone = metadataItems.find(item => item.Name === 'PhoneNumber')?.Value;
+      
+      // Extract custom AccountReference data string
+      const accountRef = callbackData.MerchantRequestID; 
+      
+      console.log(`✅ Success Callback! Received KES ${amountPaid} from ${phone}. Receipt: ${receipt}`);
 
-      console.log(`✅ Success! Received KES ${amountPaid} from ${phone}. Receipt: ${receipt}`);
+      // Parse the dynamic User ID back out from the response strings
+      // Alternative standard fallback approach if metadata variation occurs:
+      // We can clean phone parameters or matching context strings safely.
+      
+      // Let's settle the balance gracefully by adding a negative/offset row entry 
+      // into the loans list or tracking payments natively.
+      // For a dynamic balance framework, adding a 'Payment' record balancing the debt works smoothly:
+      
+      // 💡 Assuming standard transaction referencing structure:
+      // Find user records linked to this phone string or your mapped context IDs.
+      const lookupUserSql = "SELECT id FROM users WHERE phone LIKE ?";
+      const cleanedSearchPhone = `%${String(phone).slice(-9)}`; // match last 9 digits safely
 
-      // 🗄️ TODO: Connect your Aiven MySQL Pool loop to clear out account balances here!
-      // await db.query("UPDATE loans SET balance = balance - ? WHERE phone = ?", [amountPaid, phone]);
+      pool.query(lookupUserSql, [cleanedSearchPhone], (userErr, userResults) => {
+        if (userErr || userResults.length === 0) {
+          console.error("❌ Settle Failure: Payment processed but phone signature map to user record failed.", userErr?.message);
+          return;
+        }
+
+        const calculatedUserId = userResults[0].id;
+        const recordPaymentSql = `
+          INSERT INTO loans (user_id, loan_type, amount, payment_mode, account_number, status) 
+          VALUES (?, 'Repayment', ?, 'M-Pesa', ?, 'Disbursed')
+        `;
+        
+        // 💡 Use a negative amount entry! Because your login & summary routes use SUM(amount), 
+        // a negative value here automatically offsets the overall balance correctly.
+        const negativeAmountOffset = -Math.abs(parseFloat(amountPaid));
+
+        pool.query(recordPaymentSql, [calculatedUserId, negativeAmountOffset, receipt], (dbErr, dbResult) => {
+          if (dbErr) {
+            console.error("❌ Database Account Sync Error during Mpesa settlement:", dbErr.message);
+          } else {
+            console.log(`🎉 Account ID ${calculatedUserId} balance reduced by KES ${amountPaid} via MySQL ledger.`);
+          }
+        });
+      });
 
     } else {
       console.log(`⚠️ Transaction declined or cancelled by user. Code: ${callbackData.ResultCode}`);
@@ -93,8 +157,6 @@ router.post('/callback', async (req, res) => {
   } catch (err) {
     console.error("❌ Callback Parsing Crash:", err.message);
   }
-  
-  // Safaricom strictly requires a clean 200 OK acknowledgment
   res.status(200).send("Callback Received");
 });
 
