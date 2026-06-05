@@ -48,13 +48,10 @@ const initializeDatabase = () => {
       console.error("❌ Error verifying/creating users table:", err.message);
     } else {
       console.log("✅ Users table verified/created successfully.");
-      
-      // Forcefully alter the table structure on Aiven Cloud database
       pool.query(`
         ALTER TABLE users ADD COLUMN reset_code VARCHAR(10) DEFAULT NULL AFTER password
       `, (alterErr) => {
         if (alterErr) {
-          // If error code is ER_DUP_FIELDNAME (1060), it means column is already there!
           if (alterErr.errno === 1060 || alterErr.code === 'ER_DUP_FIELDNAME') {
             console.log("✅ reset_code column verified and active in cloud schema.");
           } else {
@@ -191,12 +188,14 @@ app.post('/api/forgot-password', (req, res) => {
         return res.status(500).json({ message: "Failed to allocate secure reset credentials." });
       }
       const transporter = nodemailer.createTransport({
-        service: 'gmail',
-        auth: {
-          user: process.env.EMAIL_USER, 
-          pass: process.env.EMAIL_PASS  
-        }
-      });
+  host: 'smtp.gmail.com',
+  port: 465,
+  secure: true,
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  }
+});
 
       const mailOptions = {
         from: process.env.EMAIL_USER,
