@@ -49,13 +49,19 @@ const initializeDatabase = () => {
     } else {
       console.log("✅ Users table verified/created successfully.");
       
+      // Forcefully alter the table structure on Aiven Cloud database
       pool.query(`
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code VARCHAR(10) DEFAULT NULL AFTER password
+        ALTER TABLE users ADD COLUMN reset_code VARCHAR(10) DEFAULT NULL AFTER password
       `, (alterErr) => {
         if (alterErr) {
-          console.log("ℹ️ Users table column synchronization verified.");
+          // If error code is ER_DUP_FIELDNAME (1060), it means column is already there!
+          if (alterErr.errno === 1060 || alterErr.code === 'ER_DUP_FIELDNAME') {
+            console.log("✅ reset_code column verified and active in cloud schema.");
+          } else {
+            console.error("❌ Unexpected database structure error:", alterErr.message);
+          }
         } else {
-          console.log("✅ Missing cloud columns appended successfully.");
+          console.log("🎉 Successfully injected missing reset_code column into cloud table!");
         }
       });
     }
