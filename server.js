@@ -2,7 +2,7 @@ const express = require('express');
 const mysql = require('mysql2');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
-const nodemailer = require('nodemailer'); // 1. Imported Nodemailer
+const nodemailer = require('nodemailer'); 
 const mpesaRoutes = require('./mpesa');
 require('dotenv').config();
 
@@ -40,7 +40,7 @@ const initializeDatabase = () => {
       email VARCHAR(150) UNIQUE NOT NULL,
       phone VARCHAR(50),
       password VARCHAR(255) NOT NULL,
-      reset_code VARCHAR(10) DEFAULT NULL, -- 2. Added field to store code temporarily
+      reset_code VARCHAR(10) DEFAULT NULL, 
       createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `, (err) => {
@@ -155,12 +155,11 @@ app.post('/api/login', (req, res) => {
   });
 });
 
-// 3. NEW: FORGOT PASSWORD ROUTE HANDLER
+// FORGOT PASSWORD ROUTE HANDLER
 app.post('/api/forgot-password', (req, res) => {
   const { email } = req.body;
   console.log(`👉 Password reset requested for: ${email}`);
 
-  // Step A: Check if user exists in MySQL
   const findUserQuery = "SELECT id FROM users WHERE email = ?";
   pool.query(findUserQuery, [email], async (err, results) => {
     if (err) {
@@ -172,10 +171,8 @@ app.post('/api/forgot-password', (req, res) => {
       return res.status(404).json({ message: "This email address is not registered with us!" });
     }
 
-    // Step B: User exists! Generate a 6-digit random code
     const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
 
-    // Step C: Save code temporarily into MySQL users table
     const updateCodeQuery = "UPDATE users SET reset_code = ? WHERE email = ?";
     pool.query(updateCodeQuery, [resetCode, email], async (updateErr) => {
       if (updateErr) {
@@ -183,7 +180,6 @@ app.post('/api/forgot-password', (req, res) => {
         return res.status(500).json({ message: "Failed to allocate secure reset credentials." });
       }
 
-      // Step D: Initialize Nodemailer Mail Sender
       const transporter = nodemailer.createTransport({
         service: 'gmail',
         auth: {
@@ -209,7 +205,6 @@ app.post('/api/forgot-password', (req, res) => {
         `
       };
 
-      // Step E: Fire the email away
       try {
         await transporter.sendMail(mailOptions);
         console.log(`✅ Reset verification mail successfully dispatched to ${email}`);
@@ -248,22 +243,23 @@ app.post('/api/loans', (req, res) => {
   });
 });
 
-// MPESA STK PUSH PLACEHOLDER ROUTE
+// MPESA STK PUSH PLACEHOLDER ROUTE (Fixed missing definitions)
 app.post('/api/mpesa/stkpush', async (req, res) => {
   const { phoneNumber, amount, accountReference, transactionDesc } = req.body;
   const stkPushPayload = {
-    BusinessShortCode: process.env.MPESA_SHORTCODE,
-    Password: generatedMpesaPassword,
-    Timestamp: currentTimestamp,
+    BusinessShortCode: process.env.MPESA_SHORTCODE || '174379',
+    Password: "PLACEHOLDER_PASSWORD",
+    Timestamp: "PLACEHOLDER_TIMESTAMP",
     TransactionType: "CustomerPayBillOnline",
     Amount: amount,
     PartyA: phoneNumber,
-    PartyB: process.env.MPESA_SHORTCODE,
+    PartyB: process.env.MPESA_SHORTCODE || '174379',
     PhoneNumber: phoneNumber,
-    CallBackURL: process.env.MPESA_CALLBACK_URL,
+    CallBackURL: process.env.MPESA_CALLBACK_URL || 'https://example.com/callback',
     AccountReference: accountReference || "LoanRepayment",
     TransactionDesc: transactionDesc || "Loan Repayment"
   };
+  res.status(200).json({ message: "STK Push Payload structured successfully", payload: stkPushPayload });
 });
 
 // DASHBOARD SUMMARY
