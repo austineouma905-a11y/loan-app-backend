@@ -248,22 +248,29 @@ app.post('/api/loans', (req, res) => {
   });
 });
 
-// MPESA STK PUSH PLACEHOLDER ROUTE
+// MPESA STK PUSH PLACEHOLDER ROUTE (Fixed runtime reference errors)
 app.post('/api/mpesa/stkpush', async (req, res) => {
   const { phoneNumber, amount, accountReference, transactionDesc } = req.body;
+  
+  // Safely localizing placeholders to clear ReferenceErrors during compilation
+  const generatedMpesaPassword = "STUB_PASSWORD"; 
+  const currentTimestamp = new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14);
+
   const stkPushPayload = {
-    BusinessShortCode: process.env.MPESA_SHORTCODE,
+    BusinessShortCode: process.env.MPESA_SHORTCODE || "174379",
     Password: generatedMpesaPassword,
     Timestamp: currentTimestamp,
     TransactionType: "CustomerPayBillOnline",
     Amount: amount,
     PartyA: phoneNumber,
-    PartyB: process.env.MPESA_SHORTCODE,
+    PartyB: process.env.MPESA_SHORTCODE || "174379",
     PhoneNumber: phoneNumber,
-    CallBackURL: process.env.MPESA_CALLBACK_URL,
+    CallBackURL: process.env.MPESA_CALLBACK_URL || "https://example.com/callback",
     AccountReference: accountReference || "LoanRepayment",
     TransactionDesc: transactionDesc || "Loan Repayment"
   };
+
+  res.status(200).json({ message: "Payload generated successfully", payload: stkPushPayload });
 });
 
 // DASHBOARD SUMMARY
