@@ -2,7 +2,7 @@ const express = require('express');
 const mysql = require('mysql2');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
-const nodemailer = require('nodemailer'); // 1. Imported Nodemailer
+const nodemailer = require('nodemailer');
 const mpesaRoutes = require('./mpesa');
 require('dotenv').config();
 
@@ -40,7 +40,7 @@ const initializeDatabase = () => {
       email VARCHAR(150) UNIQUE NOT NULL,
       phone VARCHAR(50),
       password VARCHAR(255) NOT NULL,
-      reset_code VARCHAR(10) DEFAULT NULL, -- 2. Added field to store code temporarily
+      reset_code VARCHAR(10) DEFAULT NULL,
       createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `, (err) => {
@@ -48,7 +48,18 @@ const initializeDatabase = () => {
       console.error("❌ Error verifying/creating users table:", err.message);
     } else {
       console.log("✅ Users table verified/created successfully.");
+      
+      pool.query(`
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code VARCHAR(10) DEFAULT NULL AFTER password
+      `, (alterErr) => {
+        if (alterErr) {
+          console.log("ℹ️ Users table column synchronization verified.");
+        } else {
+          console.log("✅ Missing cloud columns appended successfully.");
+        }
+      });
     }
+
     pool.query(`
       CREATE TABLE IF NOT EXISTS loans (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -75,7 +86,6 @@ initializeDatabase();
 
 app.use('/api/mpesa', mpesaRoutes); 
 
-// SIGNUP ROUTE
 app.post('/api/signup', async (req, res) => {
   console.log("👉 Registration request processing:", req.body);
   const { firstName, lastName, email, phone, password } = req.body;
@@ -106,7 +116,6 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-// LOGIN ROUTE
 app.post('/api/login', (req, res) => {
   const { email, password } = req.body;
   const query = "SELECT id, first_name, last_name, email, phone, password FROM users WHERE email = ?";
@@ -155,12 +164,9 @@ app.post('/api/login', (req, res) => {
   });
 });
 
-// 3. NEW: FORGOT PASSWORD ROUTE HANDLER
 app.post('/api/forgot-password', (req, res) => {
   const { email } = req.body;
   console.log(`👉 Password reset requested for: ${email}`);
-
-  // Step A: Check if user exists in MySQL
   const findUserQuery = "SELECT id FROM users WHERE email = ?";
   pool.query(findUserQuery, [email], async (err, results) => {
     if (err) {
@@ -171,19 +177,13 @@ app.post('/api/forgot-password', (req, res) => {
     if (results.length === 0) {
       return res.status(404).json({ message: "This email address is not registered with us!" });
     }
-
-    // Step B: User exists! Generate a 6-digit random code
     const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
-
-    // Step C: Save code temporarily into MySQL users table
     const updateCodeQuery = "UPDATE users SET reset_code = ? WHERE email = ?";
     pool.query(updateCodeQuery, [resetCode, email], async (updateErr) => {
       if (updateErr) {
         console.error("❌ SQL Update Code Error:", updateErr.message);
         return res.status(500).json({ message: "Failed to allocate secure reset credentials." });
       }
-
-      // Step D: Initialize Nodemailer Mail Sender
       const transporter = nodemailer.createTransport({
         service: 'gmail',
         auth: {
@@ -208,8 +208,6 @@ app.post('/api/forgot-password', (req, res) => {
           </div>
         `
       };
-
-      // Step E: Fire the email away
       try {
         await transporter.sendMail(mailOptions);
         console.log(`✅ Reset verification mail successfully dispatched to ${email}`);
@@ -222,7 +220,6 @@ app.post('/api/forgot-password', (req, res) => {
   });
 });
 
-// LOAN RECORDING ROUTE
 app.post('/api/loans', (req, res) => {
   const { userId, loanType, amount, paymentMode, accountNumber } = req.body;
   const insertLoanQuery = "INSERT INTO loans (user_id, loan_type, amount, payment_mode, account_number, status) VALUES (?, ?, ?, ?, ?, 'Disbursed')";
@@ -248,11 +245,9 @@ app.post('/api/loans', (req, res) => {
   });
 });
 
-// MPESA STK PUSH PLACEHOLDER ROUTE (Fixed runtime reference errors)
 app.post('/api/mpesa/stkpush', async (req, res) => {
   const { phoneNumber, amount, accountReference, transactionDesc } = req.body;
-  
-  // Safely localizing placeholders to clear ReferenceErrors during compilation
+
   const generatedMpesaPassword = "STUB_PASSWORD"; 
   const currentTimestamp = new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14);
 
@@ -273,7 +268,6 @@ app.post('/api/mpesa/stkpush', async (req, res) => {
   res.status(200).json({ message: "Payload generated successfully", payload: stkPushPayload });
 });
 
-// DASHBOARD SUMMARY
 app.get('/api/dashboard-summary/:userId', (req, res) => {
   const userId = req.params.userId;
 
