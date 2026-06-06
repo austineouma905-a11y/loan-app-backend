@@ -167,10 +167,12 @@ app.post('/api/login', (req, res) => {
   });
 });
 
+// 1. FORGOT PASSWORD REQUEST - Modified to generate a 4-DIGIT OTP to match your frontend sketch
 app.post('/api/forgot-password', (req, res) => {
   const { email } = req.body;
   console.log(`👉 Password reset requested for: ${email}`);
   const findUserQuery = "SELECT id FROM users WHERE email = ?";
+  
   pool.query(findUserQuery, [email], async (err, results) => {
     if (err) {
       console.error("❌ SQL Find User Error:", err.message);
@@ -180,22 +182,26 @@ app.post('/api/forgot-password', (req, res) => {
     if (results.length === 0) {
       return res.status(404).json({ message: "This email address is not registered with us!" });
     }
-    const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // Swapped to 4-Digits to precisely fulfill your handwritten [?, ?, ?, ?] inputs
+    const resetCode = Math.floor(1000 + Math.random() * 9000).toString();
     const updateCodeQuery = "UPDATE users SET reset_code = ? WHERE email = ?";
+    
     pool.query(updateCodeQuery, [resetCode, email], async (updateErr) => {
       if (updateErr) {
         console.error("❌ SQL Update Code Error:", updateErr.message);
         return res.status(500).json({ message: "Failed to allocate secure reset credentials." });
       }
+
       const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 465,
-  secure: true,
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  }
-});
+        host: 'smtp.gmail.com',
+        port: 465,
+        secure: true,
+        auth: {
+          user: process.env.EMAIL_USER,
+          pass: process.env.EMAIL_PASS
+        }
+      });
 
       const mailOptions = {
         from: process.env.EMAIL_USER,
@@ -213,6 +219,7 @@ app.post('/api/forgot-password', (req, res) => {
           </div>
         `
       };
+
       try {
         await transporter.sendMail(mailOptions);
         console.log(`✅ Reset verification mail successfully dispatched to ${email}`);
@@ -223,6 +230,51 @@ app.post('/api/forgot-password', (req, res) => {
       }
     });
   });
+});
+
+// 2. NEW ENDPOINT: VERIFY THE 4-DIGIT OTP
+app.post('/api/verify-otp', (req, res) => {
+  const { email, otp } = req.body;
+  console.log(`👉 Verifying OTP for: ${email}`);
+
+  const checkOtpQuery = "SELECT id FROM users WHERE email = ? AND reset_code = ?";
+  pool.query(checkOtpQuery, [email, otp], (err, results) => {
+    if (err) {
+      console.error("❌ SQL Verify OTP Error:", err.message);
+      return res.status(500).json({ message: "Database verification failure." });
+    }
+
+    if (results.length === 0) {
+      return res.status(400).json({ message: "Invalid or expired OTP code." });
+    }
+
+    return res.status(200).json({ message: "Successful verification." });
+  });
+});
+
+// 3. NEW ENDPOINT: RESET PASSWORD ROUTE (Commits hashed pass & cleans reset_code column)
+app.post('/api/reset-password', async (req, res) => {
+  const { email, newPassword } = req.body;
+  console.log(`👉 Resetting password for: ${email}`);
+
+  try {
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(newPassword, saltRounds);
+
+    // Update password field and instantly nullify reset_code for system safety
+    const updatePasswordQuery = "UPDATE users SET password = ?, reset_code = NULL WHERE email = ?";
+    
+    pool.query(updatePasswordQuery, [hashedPassword, email], (err, result) => {
+      if (err) {
+        console.error("❌ SQL Reset Password Error:", err.message);
+        return res.status(500).json({ message: "Failed to compile new secure credentials into MySQL database." });
+      }
+
+      return res.status(200).json({ message: "Password updated successfully!" });
+    });
+  } catch (error) {
+    return res.status(500).json({ message: "Error processing encryption payload security layers." });
+  }
 });
 
 app.post('/api/loans', (req, res) => {
