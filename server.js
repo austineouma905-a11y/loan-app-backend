@@ -54,19 +54,28 @@ const getEmailConfig = () => ({
 });
 
 const createMailTransporter = () => {
+  const { emailUser, emailPass } = getEmailConfig();
+
+  if (!emailUser || !emailPass) {
+    return null;
+  }
+
   return nodemailer.createTransport({
-    host: 'smtp-relay.brevo.com',
-    port: 587,
-    secure: false,
+    service: 'gmail',
+    connectionTimeout: 10000,
     auth: {
-      user: process.env.BREVO_SMTP_USER,
-      pass: process.env.BREVO_SMTP_PASS
+      user: emailUser,
+      pass: emailPass
+    },
+    tls: {
+      rejectUnauthorized: false
     }
   });
 };
 
 const hasEmailDeliveryConfig = () => {
-  return Boolean(process.env.BREVO_SMTP_USER && process.env.BREVO_SMTP_PASS);
+  const { emailUser, emailPass, resendApiKey } = getEmailConfig();
+  return Boolean(resendApiKey || (emailUser && emailPass));
 };
 
 const sendEmail = async ({ to, subject, html }) => {
