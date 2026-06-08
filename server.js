@@ -31,6 +31,50 @@ const pool = mysql.createPool({
   keepAliveInitialDelay: 10000
 });
 
+const promisePool = pool.promise();
+const RESET_CODE_TTL_MINUTES = parseInt(process.env.RESET_CODE_TTL_MINUTES, 10) || 15;
+const RESET_VERIFIED_TTL_MINUTES = parseInt(process.env.RESET_VERIFIED_TTL_MINUTES, 10) || 10;
+
+const normalizeEmail = (email = '') => String(email).trim().toLowerCase();
+const generateResetCode = () => Math.floor(1000 + Math.random() * 9000).toString();
+const getResetOtp = (value) => String(value || '').trim();
+const isValidResetOtp = (value) => /^\d{4}$/.test(value);
+
+const ensureColumn = (table, column, definition, afterColumn) => {
+  const afterClause = afterColumn ? ` AFTER ${afterColumn}` : '';
+  pool.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}${afterClause}`, (err) => {
+    if (!err) {
+      console.log(`Column ${table}.${column} added successfully.`);
+      return;
+    }
+
+    if (err.errno === 1060 || err.code === 'ER_DUP_FIELDNAME') {
+      console.log(`Column ${table}.${column} verified.`);
+      return;
+    }
+
+    console.error(`Unexpected database structure error for ${table}.${column}:`, err.message);
+  });
+};
+
+const createMailTransporter = () => {
+  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+    return null;
+  }
+
+  return nodemailer.createTransport({
+    service: 'gmail',
+    connectionTimeout: 10000,
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASS
+    },
+    tls: {
+      rejectUnauthorized: false
+    }
+  });
+};
+
 const initializeDatabase = () => {
   pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -41,6 +85,8 @@ const initializeDatabase = () => {
       phone VARCHAR(50),
       password VARCHAR(255) NOT NULL,
       reset_code VARCHAR(10) DEFAULT NULL,
+      reset_code_expires_at DATETIME DEFAULT NULL,
+      reset_verified_until DATETIME DEFAULT NULL,
       createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `, (err) => {
@@ -48,19 +94,9 @@ const initializeDatabase = () => {
       console.error("❌ Error verifying/creating users table:", err.message);
     } else {
       console.log("✅ Users table verified/created successfully.");
-      pool.query(`
-        ALTER TABLE users ADD COLUMN reset_code VARCHAR(10) DEFAULT NULL AFTER password
-      `, (alterErr) => {
-        if (alterErr) {
-          if (alterErr.errno === 1060 || alterErr.code === 'ER_DUP_FIELDNAME') {
-            console.log("✅ reset_code column verified and active in cloud schema.");
-          } else {
-            console.error("❌ Unexpected database structure error:", alterErr.message);
-          }
-        } else {
-          console.log("🎉 Successfully injected missing reset_code column into cloud table!");
-        }
-      });
+      ensureColumn('users', 'reset_code', 'VARCHAR(10) DEFAULT NULL', 'password');
+      ensureColumn('users', 'reset_code_expires_at', 'DATETIME DEFAULT NULL');
+      ensureColumn('users', 'reset_verified_until', 'DATETIME DEFAULT NULL');
     }
 
     pool.query(`
@@ -167,113 +203,164 @@ app.post('/api/login', (req, res) => {
   });
 });
 
-// 1. FORGOT PASSWORD REQUEST - Modified to generate a 4-DIGIT OTP to match your frontend sketch
-app.post('/api/forgot-password', (req, res) => {
-  const { email } = req.body;
-  console.log(`👉 Password reset requested for: ${email}`);
-  const findUserQuery = "SELECT id FROM users WHERE email = ?";
-  
-  pool.query(findUserQuery, [email], async (err, results) => {
-    if (err) {
-      console.error("❌ SQL Find User Error:", err.message);
-      return res.status(500).json({ message: "Database query execution failure." });
-    }
+// 1. FORGOT PASSWORD REQUEST - send a short-lived 4-digit code to the registered email.
+app.post('/api/forgot-password', async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  console.log(`Password reset requested for: ${email || 'missing email'}`);
 
-    if (results.length === 0) {
+  if (!email) {
+    return res.status(400).json({ message: "Please enter your registered email address." });
+  }
+
+  const transporter = createMailTransporter();
+  if (!transporter) {
+    return res.status(500).json({ message: "Email delivery is not configured on the server." });
+  }
+
+  try {
+    const [users] = await promisePool.query(
+      "SELECT id, first_name, email FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1",
+      [email]
+    );
+
+    if (users.length === 0) {
       return res.status(404).json({ message: "This email address is not registered with us!" });
     }
 
-    // Swapped to 4-Digits to precisely fulfill your handwritten [?, ?, ?, ?] inputs
-    const resetCode = Math.floor(1000 + Math.random() * 9000).toString();
-    const updateCodeQuery = "UPDATE users SET reset_code = ? WHERE email = ?";
-    
-    pool.query(updateCodeQuery, [resetCode, email], async (updateErr) => {
-      if (updateErr) {
-        console.error("❌ SQL Update Code Error:", updateErr.message);
-        return res.status(500).json({ message: "Failed to allocate secure reset credentials." });
-      }
+    const user = users[0];
+    const resetCode = generateResetCode();
 
-      const transporter = nodemailer.createTransport({
-        host: 'smtp.gmail.com',
-        port: 465,
-        secure: true,
-        auth: {
-          user: process.env.EMAIL_USER,
-          pass: process.env.EMAIL_PASS
-        }
-      });
+    await promisePool.query(
+      `UPDATE users
+       SET reset_code = ?,
+           reset_code_expires_at = DATE_ADD(NOW(), INTERVAL ? MINUTE),
+           reset_verified_until = NULL
+       WHERE id = ?`,
+      [resetCode, RESET_CODE_TTL_MINUTES, user.id]
+    );
 
-      const mailOptions = {
-        from: process.env.EMAIL_USER,
-        to: email,
-        subject: 'Verification Code - Loan Application',
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
-            <h2 style="color: #2c3e50; text-align: center;">Secure Password Reset</h2>
-            <p>Hello,</p>
-            <p>We received a request to initialize a password reset authorization for your account profile. Your single-use verification token code is:</p>
-            <div style="background-color: #f8f9fa; padding: 15px; text-align: center; font-size: 28px; font-weight: bold; letter-spacing: 6px; color: #16a085; border: 1px dashed #bdc3c7; border-radius: 4px; margin: 20px 0;">
-              ${resetCode}
-            </div>
-            <p style="color: #7f8c8d; font-size: 12px;">If you did not initiate this authorization transaction request, please immediately ignore this email notice securely.</p>
+    const mailOptions = {
+      from: process.env.EMAIL_USER,
+      to: user.email,
+      subject: 'Verification Code - Loan Application',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
+          <h2 style="color: #2c3e50; text-align: center;">Secure Password Reset</h2>
+          <p>Hello${user.first_name ? ` ${user.first_name}` : ''},</p>
+          <p>Use this single-use verification code to reset your password:</p>
+          <div style="background-color: #f8f9fa; padding: 15px; text-align: center; font-size: 28px; font-weight: bold; letter-spacing: 6px; color: #16a085; border: 1px dashed #bdc3c7; border-radius: 4px; margin: 20px 0;">
+            ${resetCode}
           </div>
-        `
-      };
+          <p style="color: #7f8c8d; font-size: 12px;">This code expires in ${RESET_CODE_TTL_MINUTES} minutes. If you did not request a reset, ignore this email.</p>
+        </div>
+      `
+    };
 
-      try {
-        await transporter.sendMail(mailOptions);
-        console.log(`✅ Reset verification mail successfully dispatched to ${email}`);
-        return res.status(200).json({ message: "Verification authorization code dispatched to email setup!" });
-      } catch (mailError) {
-        console.error("❌ Nodemailer Mail Dispatch Exception:", mailError.message);
-        return res.status(500).json({ message: "Mail delivery protocol timeout/failure configuration." });
-      }
-    });
-  });
+    try {
+      await transporter.sendMail(mailOptions);
+      console.log(`Reset verification mail dispatched to ${user.email}`);
+      return res.status(200).json({ message: "Verification code sent to your registered email." });
+    } catch (mailError) {
+      await promisePool.query(
+        "UPDATE users SET reset_code = NULL, reset_code_expires_at = NULL, reset_verified_until = NULL WHERE id = ?",
+        [user.id]
+      );
+      console.error("Nodemailer Mail Dispatch Exception:", mailError.message);
+      return res.status(500).json({ message: "Failed to send the verification code. Check server email settings." });
+    }
+  } catch (error) {
+    console.error("Forgot Password Error:", error.message);
+    return res.status(500).json({ message: "Database query execution failure." });
+  }
 });
 
-// 2. NEW ENDPOINT: VERIFY THE 4-DIGIT OTP
-app.post('/api/verify-otp', (req, res) => {
-  const { email, otp } = req.body;
-  console.log(`👉 Verifying OTP for: ${email}`);
+// 2. VERIFY THE 4-DIGIT OTP
+app.post('/api/verify-otp', async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const otp = getResetOtp(req.body.otp || req.body.code);
+  console.log(`Verifying OTP for: ${email || 'missing email'}`);
 
-  const checkOtpQuery = "SELECT id FROM users WHERE email = ? AND reset_code = ?";
-  pool.query(checkOtpQuery, [email, otp], (err, results) => {
-    if (err) {
-      console.error("❌ SQL Verify OTP Error:", err.message);
-      return res.status(500).json({ message: "Database verification failure." });
-    }
+  if (!email || !isValidResetOtp(otp)) {
+    return res.status(400).json({ message: "Enter the 4-digit code sent to your email." });
+  }
 
-    if (results.length === 0) {
+  try {
+    const [users] = await promisePool.query(
+      `SELECT id
+       FROM users
+       WHERE LOWER(email) = LOWER(?)
+         AND reset_code = ?
+         AND reset_code_expires_at IS NOT NULL
+         AND reset_code_expires_at > NOW()
+       LIMIT 1`,
+      [email, otp]
+    );
+
+    if (users.length === 0) {
       return res.status(400).json({ message: "Invalid or expired OTP code." });
     }
 
+    await promisePool.query(
+      "UPDATE users SET reset_verified_until = DATE_ADD(NOW(), INTERVAL ? MINUTE) WHERE id = ?",
+      [RESET_VERIFIED_TTL_MINUTES, users[0].id]
+    );
+
     return res.status(200).json({ message: "Successful verification." });
-  });
+  } catch (error) {
+    console.error("SQL Verify OTP Error:", error.message);
+    return res.status(500).json({ message: "Database verification failure." });
+  }
 });
 
-// 3. NEW ENDPOINT: RESET PASSWORD ROUTE (Commits hashed pass & cleans reset_code column)
+// 3. RESET PASSWORD ROUTE - only works after OTP verification or with a valid OTP.
 app.post('/api/reset-password', async (req, res) => {
-  const { email, newPassword } = req.body;
-  console.log(`👉 Resetting password for: ${email}`);
+  const email = normalizeEmail(req.body.email);
+  const newPassword = req.body.newPassword || req.body.password;
+  const otp = getResetOtp(req.body.otp || req.body.code);
+  console.log(`Resetting password for: ${email || 'missing email'}`);
+
+  if (!email || !newPassword) {
+    return res.status(400).json({ message: "Email and new password are required." });
+  }
+
+  if (newPassword.length < 8) {
+    return res.status(400).json({ message: "Password must be at least 8 characters long." });
+  }
+
+  if (otp && !isValidResetOtp(otp)) {
+    return res.status(400).json({ message: "Enter the 4-digit code sent to your email." });
+  }
 
   try {
-    const saltRounds = 10;
-    const hashedPassword = await bcrypt.hash(newPassword, saltRounds);
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    const params = otp ? [hashedPassword, email, otp] : [hashedPassword, email];
+    const resetCondition = otp
+      ? `LOWER(email) = LOWER(?)
+         AND reset_code = ?
+         AND reset_code_expires_at IS NOT NULL
+         AND reset_code_expires_at > NOW()`
+      : `LOWER(email) = LOWER(?)
+         AND reset_verified_until IS NOT NULL
+         AND reset_verified_until > NOW()`;
 
-    // Update password field and instantly nullify reset_code for system safety
-    const updatePasswordQuery = "UPDATE users SET password = ?, reset_code = NULL WHERE email = ?";
-    
-    pool.query(updatePasswordQuery, [hashedPassword, email], (err, result) => {
-      if (err) {
-        console.error("❌ SQL Reset Password Error:", err.message);
-        return res.status(500).json({ message: "Failed to compile new secure credentials into MySQL database." });
-      }
+    const [result] = await promisePool.query(
+      `UPDATE users
+       SET password = ?,
+           reset_code = NULL,
+           reset_code_expires_at = NULL,
+           reset_verified_until = NULL
+       WHERE ${resetCondition}`,
+      params
+    );
 
-      return res.status(200).json({ message: "Password updated successfully!" });
-    });
+    if (result.affectedRows === 0) {
+      return res.status(400).json({ message: "Please verify the OTP code before resetting your password." });
+    }
+
+    return res.status(200).json({ message: "Password updated successfully!" });
   } catch (error) {
-    return res.status(500).json({ message: "Error processing encryption payload security layers." });
+    console.error("SQL Reset Password Error:", error.message);
+    return res.status(500).json({ message: "Failed to update password." });
   }
 });
 
