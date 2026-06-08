@@ -517,7 +517,33 @@ app.post('/api/loans', (req, res) => {
   });
 });
 
-app.get('/api/dashboard-summary/:userId', (req, res) => {
+app.post('/api/change-password', async (req, res) => {
+  const { userId, currentPassword, newPassword } = req.body;
+
+  if (!userId || !currentPassword || !newPassword) {
+    return res.status(400).json({ message: 'All fields are required.' });
+  }
+  if (newPassword.length < 8) {
+    return res.status(400).json({ message: 'New password must be at least 8 characters.' });
+  }
+
+  try {
+    const [users] = await promisePool.query('SELECT password FROM users WHERE id = ? LIMIT 1', [userId]);
+    if (users.length === 0) return res.status(404).json({ message: 'User not found.' });
+
+    const match = await bcrypt.compare(currentPassword, users[0].password);
+    if (!match) return res.status(401).json({ message: 'Current password is incorrect.' });
+
+    const hashed = await bcrypt.hash(newPassword, 10);
+    await promisePool.query('UPDATE users SET password = ? WHERE id = ?', [hashed, userId]);
+    return res.status(200).json({ message: 'Password changed successfully!' });
+  } catch (error) {
+    console.error('Change Password Error:', error.message);
+    return res.status(500).json({ message: 'Failed to update password.' });
+  }
+});
+
+app.get('/api/loans/:userId', (req, res) => {
   const userId = req.params.userId;
 
   if (!userId) {
