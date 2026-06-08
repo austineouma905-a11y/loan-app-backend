@@ -58,7 +58,10 @@ const ensureColumn = (table, column, definition, afterColumn) => {
 };
 
 const createMailTransporter = () => {
-  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+  const emailUser = String(process.env.EMAIL_USER || '').trim().replace(/^['"]|['"]$/g, '');
+  const emailPass = String(process.env.EMAIL_PASS || '').trim().replace(/^['"]|['"]$/g, '').replace(/\s/g, '');
+
+  if (!emailUser || !emailPass) {
     return null;
   }
 
@@ -66,8 +69,8 @@ const createMailTransporter = () => {
     service: 'gmail',
     connectionTimeout: 10000,
     auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS
+      user: emailUser,
+      pass: emailPass
     },
     tls: {
       rejectUnauthorized: false
@@ -265,7 +268,12 @@ app.post('/api/forgot-password', async (req, res) => {
         "UPDATE users SET reset_code = NULL, reset_code_expires_at = NULL, reset_verified_until = NULL WHERE id = ?",
         [user.id]
       );
-      console.error("Nodemailer Mail Dispatch Exception:", mailError.message);
+      console.error("Nodemailer Mail Dispatch Exception:", {
+        code: mailError.code,
+        command: mailError.command,
+        responseCode: mailError.responseCode,
+        message: mailError.message
+      });
       return res.status(500).json({ message: "Failed to send the verification code. Check server email settings." });
     }
   } catch (error) {
