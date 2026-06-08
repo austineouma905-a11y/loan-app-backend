@@ -54,28 +54,19 @@ const getEmailConfig = () => ({
 });
 
 const createMailTransporter = () => {
-  const { emailUser, emailPass } = getEmailConfig();
-
-  if (!emailUser || !emailPass) {
-    return null;
-  }
-
   return nodemailer.createTransport({
-    service: 'gmail',
-    connectionTimeout: 10000,
+    host: 'smtp-relay.brevo.com',
+    port: 587,
+    secure: false,
     auth: {
-      user: emailUser,
-      pass: emailPass
-    },
-    tls: {
-      rejectUnauthorized: false
+      user: process.env.BREVO_SMTP_USER,
+      pass: process.env.BREVO_SMTP_PASS
     }
   });
 };
 
 const hasEmailDeliveryConfig = () => {
-  const { emailUser, emailPass, resendApiKey } = getEmailConfig();
-  return Boolean(resendApiKey || (emailUser && emailPass));
+  return Boolean(process.env.BREVO_SMTP_USER && process.env.BREVO_SMTP_PASS);
 };
 
 const sendEmail = async ({ to, subject, html }) => {
@@ -394,7 +385,15 @@ app.post('/api/forgot-password', async (req, res) => {
         details: mailError.details,
         message: mailError.message
       });
-      return res.status(500).json({ message: "Failed to send the verification code. Check server email settings." });
+      return res.status(500).json({ 
+        message: "Failed to send the verification code. Check server email settings.",
+        debug: {
+          provider: mailError.provider || 'smtp',
+          error: mailError.message,
+          code: mailError.code,
+          details: mailError.details
+        }
+      });
     }
   } catch (error) {
     console.error("Forgot Password Error:", error.message);
