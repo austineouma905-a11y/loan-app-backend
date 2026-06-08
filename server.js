@@ -1,8 +1,8 @@
 const express = require('express');
-const mysql = require('mysql2');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const nodemailer = require('nodemailer');
+const pool = require('./db');
 const mpesaRoutes = require('./mpesa');
 require('dotenv').config();
 
@@ -14,22 +14,6 @@ app.use(cors({
 }));
 
 app.use(express.json());
-
-const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD, 
-  database: process.env.DB_NAME,
-  port: parseInt(process.env.DB_PORT, 10) || 24231, 
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-  ssl: {
-    rejectUnauthorized: false
-  },
-  enableKeepAlive: true,
-  keepAliveInitialDelay: 10000
-});
 
 const promisePool = pool.promise();
 const RESET_CODE_TTL_MINUTES = parseInt(process.env.RESET_CODE_TTL_MINUTES, 10) || 15;
@@ -196,7 +180,72 @@ const initializeDatabase = () => {
 
 initializeDatabase();
 
-app.use('/api/mpesa', mpesaRoutes); 
+app.use('/api/mpesa', mpesaRoutes);
+
+// Diagnostic health check endpoint
+app.get('/api/health', (req, res) => {
+  const hasConsumerKey = !!String(process.env.MPESA_CONSUMER_KEY || '').trim();
+  const hasConsumerSecret = !!String(process.env.MPESA_CONSUMER_SECRET || '').trim();
+  const hasPassKey = !!String(process.env.MPESA_PASSKEY || '').trim();
+  const hasShortCode = !!String(process.env.MPESA_SHORTCODE || '').trim();
+
+  res.status(200).json({
+    status: 'OK',
+    timestamp: new Date().toISOString(),
+    database: 'connected',
+    mpesaConfig: {
+      consumerKeyLoaded: hasConsumerKey,
+      consumerSecretLoaded: hasConsumerSecret,
+      passKeyLoaded: hasPassKey,
+      shortCodeLoaded: hasShortCode,
+      shortCode: hasShortCode ? process.env.MPESA_SHORTCODE : 'NOT SET',
+      backendUrl: process.env.BACKEND_URL || 'NOT SET'
+    }
+  });
+});
+
+app.post('/api/test-mpesa-token', async (req, res) => {
+  console.log("🧪 Testing M-Pesa token generation...");
+  const axios = require('axios');
+  const consumerKey = String(process.env.MPESA_CONSUMER_KEY || '').trim();
+  const consumerSecret = String(process.env.MPESA_CONSUMER_SECRET || '').trim();
+  
+  if (!consumerKey || !consumerSecret) {
+    return res.status(400).json({ 
+      error: "Missing Consumer Key or Secret in .env",
+      consumerKeyLength: consumerKey.length,
+      consumerSecretLength: consumerSecret.length
+    });
+  }
+
+  try {
+    const auth = Buffer.from(`${consumerKey}:${consumerSecret}`).toString('base64');
+    console.log("Auth header length:", auth.length);
+    
+    const response = await axios.get(
+      'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials',
+      { 
+        headers: { Authorization: `Basic ${auth}` },
+        timeout: 10000
+      }
+    );
+    
+    res.status(200).json({
+      status: 'SUCCESS',
+      message: 'M-Pesa token generated successfully',
+      token: response.data.access_token.substring(0, 20) + '...',
+      expiresIn: response.data.expires_in
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Token generation failed',
+      status: error.response?.status,
+      errorData: error.response?.data,
+      errorMessage: error.message,
+      hint: 'Check your Consumer Key and Consumer Secret in .env file. Credentials must be registered in Safaricom Daraja portal.'
+    });
+  }
+});
 
 app.post('/api/signup', async (req, res) => {
   console.log("👉 Registration request processing:", req.body);
@@ -468,29 +517,6 @@ app.post('/api/loans', (req, res) => {
   });
 });
 
-app.post('/api/mpesa/stkpush', async (req, res) => {
-  const { phoneNumber, amount, accountReference, transactionDesc } = req.body;
-
-  const generatedMpesaPassword = "STUB_PASSWORD"; 
-  const currentTimestamp = new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14);
-
-  const stkPushPayload = {
-    BusinessShortCode: process.env.MPESA_SHORTCODE || "174379",
-    Password: generatedMpesaPassword,
-    Timestamp: currentTimestamp,
-    TransactionType: "CustomerPayBillOnline",
-    Amount: amount,
-    PartyA: phoneNumber,
-    PartyB: process.env.MPESA_SHORTCODE || "174379",
-    PhoneNumber: phoneNumber,
-    CallBackURL: process.env.MPESA_CALLBACK_URL || "https://example.com/callback",
-    AccountReference: accountReference || "LoanRepayment",
-    TransactionDesc: transactionDesc || "Loan Repayment"
-  };
-
-  res.status(200).json({ message: "Payload generated successfully", payload: stkPushPayload });
-});
-
 app.get('/api/dashboard-summary/:userId', (req, res) => {
   const userId = req.params.userId;
 
@@ -525,4 +551,4 @@ app.get('/api/dashboard-summary/:userId', (req, res) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
 
-module.exports = pool;
+

@@ -2,93 +2,171 @@ const express = require('express');
 const axios = require('axios');
 const router = express.Router();
 require('dotenv').config();
-const pool = require('./server'); 
+const pool = require('./db');
 
 const getMpesaToken = async (req, res, next) => {
-  const consumerKey = process.env.MPESA_CONSUMER_KEY;
-  const consumerSecret = process.env.MPESA_CONSUMER_SECRET;
+  const consumerKey = String(process.env.MPESA_CONSUMER_KEY || '').trim();
+  const consumerSecret = String(process.env.MPESA_CONSUMER_SECRET || '').trim();
+  
+  if (!consumerKey || !consumerSecret) {
+    console.error("❌ Missing M-Pesa credentials:", { 
+      hasKey: !!consumerKey, 
+      hasSecret: !!consumerSecret 
+    });
+    return res.status(500).json({ error: "M-Pesa API credentials not configured on server" });
+  }
   
   const auth = Buffer.from(`${consumerKey}:${consumerSecret}`).toString('base64');
 
   try {
+    console.log("🔐 Requesting M-Pesa token from Safaricom...");
     const response = await axios.get(
       'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials',
-      { headers: { Authorization: `Basic ${auth}` } }
+      { 
+        headers: { Authorization: `Basic ${auth}` },
+        timeout: 10000
+      }
     );
-    req.mpesaToken = response.data.access_token;
-    next();
+    
+    if (response.data && response.data.access_token) {
+      req.mpesaToken = response.data.access_token;
+      console.log("✅ M-Pesa token generated successfully");
+      next();
+    } else {
+      console.error("❌ No access token in response:", response.data);
+      res.status(500).json({ error: "Invalid token response from M-Pesa service" });
+    }
   } catch (error) {
-    console.error("❌ Safaricom Token Error:", error.response?.data || error.message);
-    res.status(500).json({ error: "Failed to generate authentication token" });
+    console.error("❌ Safaricom Token Error:", {
+      status: error.response?.status,
+      data: error.response?.data,
+      message: error.message
+    });
+    res.status(500).json({ error: "Failed to generate authentication token. Check server logs." });
   }
 };
 router.post('/stkpush', getMpesaToken, async (req, res) => {
-  console.log("DEBUG KEYS:", process.env.MPESA_CONSUMER_KEY ? "EXISTS" : "MISSING");
-  console.log("DEBUG KEYS:", process.env.MPESA_CONSUMER_SECRET ? "EXISTS" : "MISSING");
-  console.log("DEBUG KEYS:", process.env.MPESA_PASSKEY ? "EXISTS" : "MISSING");
-  console.log("DEBUG KEYS:", process.env.MPESA_SHORTCODE ? "EXISTS" : "MISSING");
-  const { phoneNumber, amount, userId, accountReference, transactionDesc } = req.body; 
+  const { phoneNumber, amount, userId, accountReference, transactionDesc } = req.body;
   const token = req.mpesaToken;
 
-  if (!accountReference) {
-    return res.status(400).json({ error: "Missing identifying accountReference parameter" });
+  // Validate required inputs
+  if (!phoneNumber || !amount || !accountReference) {
+    return res.status(400).json({ 
+      error: "Missing required parameters: phoneNumber, amount, accountReference" 
+    });
   }
 
-  let formattedPhone = phoneNumber.trim().replace(/\s+/g, '');
-  if (formattedPhone.startsWith('0')) {
-    formattedPhone = `254${formattedPhone.slice(1)}`;
-  } else if (formattedPhone.startsWith('+')) {
-    formattedPhone = formattedPhone.slice(1);
+  if (!token) {
+    return res.status(500).json({ 
+      error: "Failed to obtain M-Pesa access token" 
+    });
   }
 
-  const shortCode = process.env.MPESA_SHORTCODE || "174379"; 
-  const passKey = process.env.MPESA_PASSKEY;
-  const now = new Date();
-  const eatOffset = 3 * 60 * 60 * 1000; 
-  const eatDate = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + eatOffset);
+  // Validate amount
+  const numAmount = parseFloat(amount);
+  if (isNaN(numAmount) || numAmount <= 0) {
+    return res.status(400).json({ 
+      error: "Invalid amount. Must be a positive number." 
+    });
+  }
 
-  const timestamp = 
-    eatDate.getFullYear() +
-    ("0" + (eatDate.getMonth() + 1)).slice(-2) +
-    ("0" + eatDate.getDate()).slice(-2) +
-    ("0" + eatDate.getHours()).slice(-2) +
-    ("0" + eatDate.getMinutes()).slice(-2) +
-    ("0" + eatDate.getSeconds()).slice(-2);
-
-  const password = Buffer.from(`${shortCode}${passKey}${timestamp}`).toString('base64');
-
-  const liveBackendUrl = process.env.BACKEND_URL || "https://loan-app-backend-vg4d.onrender.com";
-  const finalCallbackUrl = `${liveBackendUrl.replace(/\/$/, '')}/api/mpesa/callback`;
-
-  const stkPayload = {
-    BusinessShortCode: shortCode,
-    Password: password,
-    Timestamp: timestamp,
-    TransactionType: "CustomerPayBillOnline",
-    Amount: Math.ceil(amount), 
-    PartyA: formattedPhone,
-    PartyB: shortCode,
-    PhoneNumber: formattedPhone,
-    CallBackURL: finalCallbackUrl, 
-    AccountReference: accountReference ,
-    TransactionDesc: transactionDesc || "Loan Settlement Portal"
-  };
-console.log("📤 Prepared STK Push Payload:", stkPayload);
   try {
-    console.log(`🚀 Dispatching STK Push to ${formattedPhone} for KES ${stkPayload.Amount}...`);
+    let formattedPhone = String(phoneNumber).trim().replace(/\s+/g, '');
+    if (formattedPhone.startsWith('0')) {
+      formattedPhone = `254${formattedPhone.slice(1)}`;
+    } else if (formattedPhone.startsWith('+')) {
+      formattedPhone = formattedPhone.replace('+', '');
+    } else if (!formattedPhone.startsWith('254')) {
+      formattedPhone = `254${formattedPhone}`;
+    }
+
+    const shortCode = String(process.env.MPESA_SHORTCODE || '174379').trim();
+    const passKey = String(process.env.MPESA_PASSKEY || '').trim();
+
+    if (!passKey) {
+      console.error("❌ MPESA_PASSKEY not configured");
+      return res.status(500).json({ error: "M-Pesa passkey not configured on server" });
+    }
+
+    // Generate timestamp in EAT (UTC+3) timezone
+    const now = new Date();
+    const utcTime = now.getTime() + (now.getTimezoneOffset() * 60000);
+    const eatTime = new Date(utcTime + (3 * 60 * 60 * 1000));
+
+    const timestamp = 
+      eatTime.getFullYear() +
+      String(eatTime.getMonth() + 1).padStart(2, '0') +
+      String(eatTime.getDate()).padStart(2, '0') +
+      String(eatTime.getHours()).padStart(2, '0') +
+      String(eatTime.getMinutes()).padStart(2, '0') +
+      String(eatTime.getSeconds()).padStart(2, '0');
+
+    const passwordString = `${shortCode}${passKey}${timestamp}`;
+    const password = Buffer.from(passwordString).toString('base64');
+
+    const liveBackendUrl = String(process.env.BACKEND_URL || 'https://loan-app-backend-vg4d.onrender.com').trim();
+    const finalCallbackUrl = `${liveBackendUrl.replace(/\/$/, '')}/api/mpesa/callback`;
+
+    const stkPayload = {
+      BusinessShortCode: shortCode,
+      Password: password,
+      Timestamp: timestamp,
+      TransactionType: "CustomerPayBillOnline",
+      Amount: Math.ceil(numAmount),
+      PartyA: formattedPhone,
+      PartyB: shortCode,
+      PhoneNumber: formattedPhone,
+      CallBackURL: finalCallbackUrl,
+      AccountReference: String(accountReference).trim(),
+      TransactionDesc: String(transactionDesc || "Loan Settlement Portal").trim()
+    };
+
+    // Debug logging
+    console.log(`📋 STK Push Debug Info:`);
+    console.log(`   ShortCode: ${shortCode}`);
+    console.log(`   Timestamp: ${timestamp}`);
+    console.log(`   Password String: ${passwordString}`);
+    console.log(`   Password (base64): ${password}`);
+    console.log(`   Phone: ${formattedPhone}`);
+    console.log(`   Amount: ${stkPayload.Amount}`);
+    console.log(`🚀 Sending STK Push to ${formattedPhone} for KES ${stkPayload.Amount}...`);
+
     const response = await axios.post(
       'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
       stkPayload,
-      { headers: { Authorization: `Bearer ${token}` } }
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 15000
+      }
     );
-    
-    res.status(200).json({ 
-      message: "STK Push sent successfully!", 
-      merchantRequestID: response.data.MerchantRequestID 
-    });
+
+    if (response.data && response.data.ResponseCode === '0') {
+      console.log("✅ STK Push successful:", response.data);
+      res.status(200).json({
+        message: "STK Push sent successfully! Check your phone for M-Pesa prompt.",
+        merchantRequestID: response.data.MerchantRequestID,
+        checkoutRequestID: response.data.CheckoutRequestID
+      });
+    } else {
+      console.error("❌ STK Push failed - Response:", response.data);
+      res.status(400).json({
+        error: response.data?.ResponseDescription || "Failed to send STK Push",
+        responseCode: response.data?.ResponseCode
+      });
+    }
   } catch (error) {
-    console.error("❌ STK Push Processing Error Details:", error.response?.data || error.message);
-    res.status(500).json({ error: "Failed to trigger Daraja PIN prompt" });
+    console.error("❌ STK Push Error:", {
+      status: error.response?.status,
+      data: error.response?.data,
+      message: error.message
+    });
+    res.status(500).json({
+      error: error.response?.data?.errorMessage || "Failed to process STK Push request",
+      details: error.message
+    });
   }
 });
 
