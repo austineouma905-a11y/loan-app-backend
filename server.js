@@ -57,9 +57,20 @@ const ensureColumn = (table, column, definition, afterColumn) => {
   });
 };
 
+const cleanEnvValue = (value = '', removeWhitespace = false) => {
+  const cleaned = String(value || '').trim().replace(/^['"]|['"]$/g, '');
+  return removeWhitespace ? cleaned.replace(/\s/g, '') : cleaned;
+};
+
+const getEmailConfig = () => ({
+  emailUser: cleanEnvValue(process.env.EMAIL_USER),
+  emailPass: cleanEnvValue(process.env.EMAIL_PASS, true),
+  emailFrom: cleanEnvValue(process.env.EMAIL_FROM),
+  resendApiKey: cleanEnvValue(process.env.RESEND_API_KEY)
+});
+
 const createMailTransporter = () => {
-  const emailUser = String(process.env.EMAIL_USER || '').trim().replace(/^['"]|['"]$/g, '');
-  const emailPass = String(process.env.EMAIL_PASS || '').trim().replace(/^['"]|['"]$/g, '').replace(/\s/g, '');
+  const { emailUser, emailPass } = getEmailConfig();
 
   if (!emailUser || !emailPass) {
     return null;
@@ -76,6 +87,65 @@ const createMailTransporter = () => {
       rejectUnauthorized: false
     }
   });
+};
+
+const hasEmailDeliveryConfig = () => {
+  const { emailUser, emailPass, resendApiKey } = getEmailConfig();
+  return Boolean(resendApiKey || (emailUser && emailPass));
+};
+
+const sendEmail = async ({ to, subject, html }) => {
+  const { emailUser, emailFrom, resendApiKey } = getEmailConfig();
+
+  if (resendApiKey) {
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${resendApiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: emailFrom || 'Loan App <onboarding@resend.dev>',
+        to,
+        subject,
+        html
+      })
+    });
+
+    const responseBody = await response.text();
+    let payload = {};
+
+    try {
+      payload = responseBody ? JSON.parse(responseBody) : {};
+    } catch (parseError) {
+      payload = { message: responseBody };
+    }
+
+    if (!response.ok) {
+      const error = new Error(payload.message || payload.error?.message || `Resend API failed with status ${response.status}`);
+      error.provider = 'resend';
+      error.status = response.status;
+      error.details = payload;
+      throw error;
+    }
+
+    return { provider: 'resend', id: payload.id };
+  }
+
+  const transporter = createMailTransporter();
+
+  if (!transporter) {
+    throw new Error('Email delivery is not configured on the server.');
+  }
+
+  await transporter.sendMail({
+    from: emailFrom || emailUser,
+    to,
+    subject,
+    html
+  });
+
+  return { provider: 'smtp' };
 };
 
 const initializeDatabase = () => {
@@ -215,8 +285,7 @@ app.post('/api/forgot-password', async (req, res) => {
     return res.status(400).json({ message: "Please enter your registered email address." });
   }
 
-  const transporter = createMailTransporter();
-  if (!transporter) {
+  if (!hasEmailDeliveryConfig()) {
     return res.status(500).json({ message: "Email delivery is not configured on the server." });
   }
 
@@ -243,7 +312,6 @@ app.post('/api/forgot-password', async (req, res) => {
     );
 
     const mailOptions = {
-      from: process.env.EMAIL_USER,
       to: user.email,
       subject: 'Verification Code - Loan Application',
       html: `
@@ -260,18 +328,21 @@ app.post('/api/forgot-password', async (req, res) => {
     };
 
     try {
-      await transporter.sendMail(mailOptions);
-      console.log(`Reset verification mail dispatched to ${user.email}`);
+      const delivery = await sendEmail(mailOptions);
+      console.log(`Reset verification mail dispatched to ${user.email} via ${delivery.provider}`);
       return res.status(200).json({ message: "Verification code sent to your registered email." });
     } catch (mailError) {
       await promisePool.query(
         "UPDATE users SET reset_code = NULL, reset_code_expires_at = NULL, reset_verified_until = NULL WHERE id = ?",
         [user.id]
       );
-      console.error("Nodemailer Mail Dispatch Exception:", {
+      console.error("Password Reset Mail Dispatch Exception:", {
+        provider: mailError.provider || 'smtp',
         code: mailError.code,
         command: mailError.command,
+        status: mailError.status,
         responseCode: mailError.responseCode,
+        details: mailError.details,
         message: mailError.message
       });
       return res.status(500).json({ message: "Failed to send the verification code. Check server email settings." });
