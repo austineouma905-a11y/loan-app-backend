@@ -551,6 +551,19 @@ app.post('/api/change-password', async (req, res) => {
   }
 });
 
+app.get('/api/balance/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const [result] = await promisePool.query(
+      "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status = 'Disbursed'",
+      [userId]
+    );
+    return res.status(200).json({ loanBalance: parseFloat(result[0].total_balance || 0) });
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to fetch balance.' });
+  }
+});
+
 app.get('/api/loans/:userId', (req, res) => {
   const userId = req.params.userId;
 
