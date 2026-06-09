@@ -582,7 +582,41 @@ app.get('/api/loans/:userId', (req, res) => {
   });
 });
 
-const PORT = process.env.PORT || 5000;
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'admin123';
+
+const adminAuth = (req, res, next) => {
+  const secret = req.headers['x-admin-secret'];
+  if (secret !== ADMIN_SECRET) return res.status(401).json({ message: 'Unauthorized' });
+  next();
+};
+
+app.get('/api/admin/users', adminAuth, async (req, res) => {
+  try {
+    const [users] = await promisePool.query(
+      'SELECT id, first_name, last_name, email, phone, createdAt FROM users ORDER BY createdAt DESC'
+    );
+    res.status(200).json({ users });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to fetch users.' });
+  }
+});
+
+app.get('/api/admin/loans', adminAuth, async (req, res) => {
+  try {
+    const [loans] = await promisePool.query(`
+      SELECT l.id, l.loan_type, l.amount, l.payment_mode, l.status, l.date_applied,
+             u.first_name, u.last_name, u.email, u.phone
+      FROM loans l
+      JOIN users u ON l.user_id = u.id
+      ORDER BY l.date_applied DESC
+    `);
+    res.status(200).json({ loans });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to fetch loans.' });
+  }
+});
+
+
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
 
 
