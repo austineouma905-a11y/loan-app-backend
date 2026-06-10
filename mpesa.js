@@ -88,7 +88,6 @@ router.post('/stkpush', getMpesaToken, async (req, res) => {
       return res.status(500).json({ error: "M-Pesa passkey not configured on server" });
     }
 
-    // Generate timestamp in EAT (UTC+3) timezone
     const now = new Date();
     const utcTime = now.getTime() + (now.getTimezoneOffset() * 60000);
     const eatTime = new Date(utcTime + (3 * 60 * 60 * 1000));
@@ -104,7 +103,7 @@ router.post('/stkpush', getMpesaToken, async (req, res) => {
     const passwordString = `${shortCode}${passKey}${timestamp}`;
     const password = Buffer.from(passwordString).toString('base64');
 
-    const liveBackendUrl = String(process.env.BACKEND_URL || 'https://loan-app-backend-vg4d.onrender.com').trim();
+    const liveBackendUrl = String(process.env.BACKEND_URL || '').trim();
     const finalCallbackUrl = `${liveBackendUrl.replace(/\/$/, '')}/api/mpesa/callback`;
 
     const stkPayload = {
@@ -121,7 +120,6 @@ router.post('/stkpush', getMpesaToken, async (req, res) => {
       TransactionDesc: String(transactionDesc || "Loan Settlement Portal").trim()
     };
 
-    // Debug logging
     console.log(`📋 STK Push Debug Info:`);
     console.log(`   ShortCode: ${shortCode}`);
     console.log(`   Timestamp: ${timestamp}`);
@@ -185,12 +183,9 @@ router.post('/callback', async (req, res) => {
       const lookupUserSql = "SELECT id FROM users WHERE phone LIKE ?";
       const cleanedSearchPhone = `%${String(phone).slice(-9)}`; 
 
-      pool.query(lookupUserSql, [cleanedSearchPhone], (userErr, userResults) => {
-        if (userErr || userResults.length === 0) {
-          console.error("❌ Settle Failure: Payment processed but phone signature map to user record failed.", userErr?.message);
-          return;
-        }
+      const [userResults] = await pool.promise().query(lookupUserSql, [cleanedSearchPhone]);
 
+      if (userResults.length > 0) {
         const calculatedUserId = userResults[0].id;
         const recordPaymentSql = `
           INSERT INTO loans (user_id, loan_type, amount, payment_mode, account_number, status) 
@@ -198,15 +193,11 @@ router.post('/callback', async (req, res) => {
         `;
         const negativeAmountOffset = -Math.abs(parseFloat(amountPaid));
 
-        pool.query(recordPaymentSql, [calculatedUserId, negativeAmountOffset, receipt], (dbErr, dbResult) => {
-          if (dbErr) {
-            console.error("❌ Database Account Sync Error during Mpesa settlement:", dbErr.message);
-          } else {
-            console.log(`🎉 Account ID ${calculatedUserId} balance reduced by KES ${amountPaid} via MySQL ledger.`);
-          }
-        });
-      });
-
+        await pool.promise().query(recordPaymentSql, [calculatedUserId, negativeAmountOffset, receipt]);
+        console.log(`🎉 Account ID ${calculatedUserId} balance reduced by KES ${amountPaid} via MySQL ledger.`);
+      } else {
+        console.error("❌ Settle Failure: Payment processed but phone signature map to user record failed.");
+      }
     } else {
       console.log(`⚠️ Transaction declined or cancelled by user. Code: ${callbackData.ResultCode}`);
     }

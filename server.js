@@ -525,6 +525,28 @@ app.post('/api/loans', (req, res) => {
   });
 });
 
+app.put('/api/users/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const { firstName, lastName, phone } = req.body;
+
+  console.log(`Update request for User ID: ${userId}`, req.body);
+
+  if (!firstName || !lastName || !phone) {
+    return res.status(400).json({ message: 'First name, last name, and phone are required.' });
+  }
+
+  const sql = 'UPDATE users SET first_name = ?, last_name = ?, phone = ? WHERE id = ?';
+  pool.query(sql, [firstName, lastName, phone, userId], (err, result) => {
+    if (err) {
+      console.error('❌ Update Profile SQL Error:', err.message);
+      return res.status(500).json({ message: 'Failed to update profile information.' });
+    }
+
+    if (result.affectedRows === 0) return res.status(404).json({ message: 'User not found.' });
+    return res.status(200).json({ message: 'Profile updated successfully!' });
+  });
+});
+
 app.post('/api/change-password', async (req, res) => {
   const { userId, currentPassword, newPassword } = req.body;
 
@@ -548,6 +570,20 @@ app.post('/api/change-password', async (req, res) => {
   } catch (error) {
     console.error('Change Password Error:', error.message);
     return res.status(500).json({ message: 'Failed to update password.' });
+  }
+});
+
+app.get('/api/transactions/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const [transactions] = await promisePool.query(
+      `SELECT id, loan_type, amount, payment_mode, account_number, status, date_applied 
+       FROM loans WHERE user_id = ? ORDER BY date_applied DESC`,
+      [userId]
+    );
+    return res.status(200).json({ transactions });
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to fetch transactions.' });
   }
 });
 
@@ -632,5 +668,3 @@ app.get('/api/admin/loans', adminAuth, async (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
-
-
