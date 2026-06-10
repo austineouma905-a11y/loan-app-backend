@@ -47,14 +47,123 @@ const cleanEnvValue = (value = '', removeWhitespace = false) => {
 };
 
 const getEmailConfig = () => ({
+  emailProvider: cleanEnvValue(process.env.EMAIL_PROVIDER).toLowerCase(),
   emailUser: cleanEnvValue(process.env.EMAIL_USER),
   emailPass: cleanEnvValue(process.env.EMAIL_PASS, true),
   emailFrom: cleanEnvValue(process.env.EMAIL_FROM),
-  resendApiKey: cleanEnvValue(process.env.RESEND_API_KEY)
+  resendApiKey: cleanEnvValue(process.env.RESEND_API_KEY),
+  brevoSmtpUser: cleanEnvValue(process.env.BREVO_SMTP_USER),
+  brevoSmtpPass: cleanEnvValue(process.env.BREVO_SMTP_PASS, true),
+  brevoFrom: cleanEnvValue(process.env.BREVO_FROM || process.env.BREVO_SENDER_EMAIL),
+  smtpHost: cleanEnvValue(process.env.SMTP_HOST) || 'smtp-relay.brevo.com',
+  smtpPort: parseInt(process.env.SMTP_PORT, 10) || 587,
+  smtpSecure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true'
 });
 
-const createMailTransporter = () => {
-  const { emailUser, emailPass } = getEmailConfig();
+const isResendTestSender = (from = '') => !from || /onboarding@resend\.dev/i.test(from);
+
+const createMailError = (provider, message, details) => {
+  const error = new Error(message);
+  error.provider = provider;
+  if (details) error.details = details;
+  return error;
+};
+
+const getEmailDiagnostics = () => {
+  const {
+    emailProvider,
+    emailUser,
+    emailPass,
+    emailFrom,
+    resendApiKey,
+    brevoSmtpUser,
+    brevoSmtpPass,
+    brevoFrom
+  } = getEmailConfig();
+
+  const requestedProvider = emailProvider || 'auto';
+  const brevoSender = emailFrom || brevoFrom;
+  const resendFrom = emailFrom || 'Loan App <onboarding@resend.dev>';
+  const brevoReady = Boolean(brevoSmtpUser && brevoSmtpPass && brevoSender);
+  const gmailReady = Boolean(emailUser && emailPass);
+  const resendReady = Boolean(resendApiKey && !isResendTestSender(resendFrom));
+  const canSendToAllUsers = requestedProvider === 'brevo'
+    ? brevoReady
+    : requestedProvider === 'gmail'
+      ? gmailReady
+      : requestedProvider === 'resend'
+        ? resendReady
+        : Boolean(brevoReady || gmailReady || resendReady);
+
+  let activeProvider = null;
+  if (requestedProvider === 'auto') {
+    activeProvider = brevoReady ? 'brevo' : gmailReady ? 'gmail' : resendReady ? 'resend' : null;
+  } else if (canSendToAllUsers) {
+    activeProvider = requestedProvider;
+  }
+
+  const issues = [];
+  if (brevoSmtpUser && brevoSmtpPass && !brevoSender) {
+    issues.push('Brevo SMTP is set, but EMAIL_FROM or BREVO_FROM is missing. Brevo needs a verified sender address.');
+  }
+  if (resendApiKey && isResendTestSender(resendFrom)) {
+    issues.push('Resend is using onboarding@resend.dev, which only sends to verified test recipients.');
+  }
+  if (!canSendToAllUsers) {
+    issues.push('No email provider is fully configured for sending OTPs to all users.');
+  }
+
+  return {
+    requestedProvider,
+    activeProvider,
+    canSendToAllUsers,
+    providers: {
+      brevo: {
+        credentialsLoaded: Boolean(brevoSmtpUser && brevoSmtpPass),
+        senderConfigured: Boolean(brevoSender),
+        ready: brevoReady
+      },
+      gmail: {
+        credentialsLoaded: gmailReady,
+        ready: gmailReady
+      },
+      resend: {
+        apiKeyLoaded: Boolean(resendApiKey),
+        productionSenderConfigured: Boolean(resendApiKey && !isResendTestSender(resendFrom)),
+        ready: resendReady
+      }
+    },
+    issues
+  };
+};
+
+const createMailTransporter = (provider = 'gmail') => {
+  const {
+    emailUser,
+    emailPass,
+    brevoSmtpUser,
+    brevoSmtpPass,
+    smtpHost,
+    smtpPort,
+    smtpSecure
+  } = getEmailConfig();
+
+  if (provider === 'brevo') {
+    if (!brevoSmtpUser || !brevoSmtpPass) {
+      return null;
+    }
+
+    return nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpSecure,
+      connectionTimeout: 10000,
+      auth: {
+        user: brevoSmtpUser,
+        pass: brevoSmtpPass
+      }
+    });
+  }
 
   if (!emailUser || !emailPass) {
     return null;
@@ -73,63 +182,133 @@ const createMailTransporter = () => {
   });
 };
 
-const hasEmailDeliveryConfig = () => {
-  const { emailUser, emailPass, resendApiKey } = getEmailConfig();
-  return Boolean(resendApiKey || (emailUser && emailPass));
-};
-
 const sendEmail = async ({ to, subject, html }) => {
-  const { emailUser, emailFrom, resendApiKey } = getEmailConfig();
+  const {
+    emailProvider,
+    emailUser,
+    emailPass,
+    emailFrom,
+    resendApiKey,
+    brevoSmtpUser,
+    brevoSmtpPass,
+    brevoFrom
+  } = getEmailConfig();
 
-  if (resendApiKey) {
-    const response = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${resendApiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        from: emailFrom || 'Loan App <onboarding@resend.dev>',
-        to,
-        subject,
-        html
-      })
-    });
+  const provider = emailProvider || 'auto';
+  const canUseBrevo = Boolean(brevoSmtpUser && brevoSmtpPass);
+  const canUseGmail = Boolean(emailUser && emailPass);
+  const resendFrom = emailFrom || 'Loan App <onboarding@resend.dev>';
+  const brevoFromAddress = emailFrom || brevoFrom;
+  const candidates = provider === 'auto'
+    ? [
+        canUseBrevo ? 'brevo' : null,
+        canUseGmail ? 'gmail' : null,
+        resendApiKey ? 'resend' : null
+      ].filter(Boolean)
+    : [provider];
 
-    const responseBody = await response.text();
-    let payload = {};
+  let lastError = null;
 
+  for (const candidate of candidates) {
     try {
-      payload = responseBody ? JSON.parse(responseBody) : {};
-    } catch (parseError) {
-      payload = { message: responseBody };
-    }
+      if (candidate === 'brevo') {
+        const transporter = createMailTransporter('brevo');
 
-    if (!response.ok) {
-      const error = new Error(payload.message || payload.error?.message || `Resend API failed with status ${response.status}`);
-      error.provider = 'resend';
-      error.status = response.status;
-      error.details = payload;
-      throw error;
-    }
+        if (!transporter) {
+          throw createMailError('brevo', 'Brevo SMTP delivery is not configured on the server.');
+        }
+        if (!brevoFromAddress) {
+          throw createMailError('brevo', 'Brevo needs EMAIL_FROM or BREVO_FROM set to a verified sender address.');
+        }
 
-    return { provider: 'resend', id: payload.id };
+        await transporter.sendMail({
+          from: brevoFromAddress,
+          to,
+          subject,
+          html
+        });
+
+        return { provider: 'brevo' };
+      }
+
+      if (candidate === 'gmail') {
+        const transporter = createMailTransporter('gmail');
+
+        if (!transporter) {
+          throw createMailError('gmail', 'Gmail SMTP delivery is not configured on the server.');
+        }
+
+        await transporter.sendMail({
+          from: emailFrom || emailUser,
+          to,
+          subject,
+          html
+        });
+
+        return { provider: 'gmail' };
+      }
+
+      if (candidate === 'resend') {
+        if (!resendApiKey) {
+          throw createMailError('resend', 'Resend API key is not configured on the server.');
+        }
+        if (isResendTestSender(resendFrom)) {
+          throw createMailError('resend', 'Resend test sender only delivers to verified test recipients. Set EMAIL_FROM to a verified sender/domain, or use EMAIL_PROVIDER=brevo.');
+        }
+
+        const response = await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${resendApiKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            from: resendFrom,
+            to,
+            subject,
+            html
+          })
+        });
+
+        const responseBody = await response.text();
+        let payload = {};
+
+        try {
+          payload = responseBody ? JSON.parse(responseBody) : {};
+        } catch (parseError) {
+          payload = { message: responseBody };
+        }
+
+        if (!response.ok) {
+          const error = createMailError(
+            'resend',
+            payload.message || payload.error?.message || `Resend API failed with status ${response.status}`,
+            payload
+          );
+          error.status = response.status;
+          throw error;
+        }
+
+        return { provider: 'resend', id: payload.id };
+      }
+
+      throw createMailError(candidate, `Unknown email provider: ${candidate}`);
+    } catch (error) {
+      lastError = error;
+      if (provider !== 'auto') throw error;
+      console.error(`Email delivery via ${candidate} failed:`, {
+        provider: error.provider || candidate,
+        code: error.code,
+        command: error.command,
+        status: error.status,
+        responseCode: error.responseCode,
+        details: error.details,
+        message: error.message
+      });
+    }
   }
 
-  const transporter = createMailTransporter();
-
-  if (!transporter) {
-    throw new Error('Email delivery is not configured on the server.');
-  }
-
-  await transporter.sendMail({
-    from: emailFrom || emailUser,
-    to,
-    subject,
-    html
-  });
-
-  return { provider: 'smtp' };
+  throw lastError || createMailError('email', 'Email delivery is not configured on the server.');
 };
 
 const initializeDatabase = () => {
@@ -188,11 +367,13 @@ app.get('/api/health', (req, res) => {
   const hasConsumerSecret = !!String(process.env.MPESA_CONSUMER_SECRET || '').trim();
   const hasPassKey = !!String(process.env.MPESA_PASSKEY || '').trim();
   const hasShortCode = !!String(process.env.MPESA_SHORTCODE || '').trim();
+  const emailDiagnostics = getEmailDiagnostics();
 
   res.status(200).json({
     status: 'OK',
     timestamp: new Date().toISOString(),
     database: 'connected',
+    emailConfig: emailDiagnostics,
     mpesaConfig: {
       consumerKeyLoaded: hasConsumerKey,
       consumerSecretLoaded: hasConsumerSecret,
@@ -334,8 +515,12 @@ app.post('/api/forgot-password', async (req, res) => {
     return res.status(400).json({ message: "Please enter your registered email address." });
   }
 
-  if (!hasEmailDeliveryConfig()) {
-    return res.status(500).json({ message: "Email delivery is not configured on the server." });
+  const emailDiagnostics = getEmailDiagnostics();
+  if (!emailDiagnostics.canSendToAllUsers) {
+    return res.status(500).json({
+      message: emailDiagnostics.issues[0] || "Email delivery is not configured on the server.",
+      emailConfig: emailDiagnostics
+    });
   }
 
   try {
