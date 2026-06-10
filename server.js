@@ -103,10 +103,16 @@ const getEmailDiagnostics = () => {
   }
 
   const issues = [];
-  if (brevoSmtpUser && brevoSmtpPass && !brevoSender) {
+  const checksBrevo = requestedProvider === 'brevo' || requestedProvider === 'auto';
+  const checksResend = requestedProvider === 'resend' || requestedProvider === 'auto';
+
+  if (checksBrevo && (!brevoSmtpUser || !brevoSmtpPass)) {
+    issues.push('Brevo SMTP credentials are missing. Set BREVO_SMTP_USER and BREVO_SMTP_PASS.');
+  }
+  if (checksBrevo && brevoSmtpUser && brevoSmtpPass && !brevoSender) {
     issues.push('Brevo SMTP is set, but EMAIL_FROM or BREVO_FROM is missing. Brevo needs a verified sender address.');
   }
-  if (resendApiKey && isResendTestSender(resendFrom)) {
+  if (checksResend && resendApiKey && isResendTestSender(resendFrom)) {
     issues.push('Resend is using onboarding@resend.dev, which only sends to verified test recipients.');
   }
   if (!canSendToAllUsers) {
