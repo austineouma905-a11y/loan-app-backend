@@ -525,25 +525,34 @@ app.post('/api/loans', (req, res) => {
   });
 });
 
-app.put('/api/users/:userId', async (req, res) => {
-  const { userId } = req.params;
-  const { firstName, lastName, phone } = req.body;
+app.post('/api/update-profile', (req, res) => {
+  const { userId, firstName, lastName, email, phone } = req.body;
 
-  console.log(`Update request for User ID: ${userId}`, req.body);
-
-  if (!firstName || !lastName || !phone) {
-    return res.status(400).json({ message: 'First name, last name, and phone are required.' });
+  if (!userId || !firstName || !lastName || !email || !phone) {
+    return res.status(400).json({ message: "All profile fields are required." });
   }
 
-  const sql = 'UPDATE users SET first_name = ?, last_name = ?, phone = ? WHERE id = ?';
-  pool.query(sql, [firstName, lastName, phone, userId], (err, result) => {
+  const sql = `
+    UPDATE users 
+    SET first_name = ?, last_name = ?, email = ?, phone = ? 
+    WHERE id = ?
+  `;
+  const values = [firstName, lastName, email, phone, userId];
+
+  pool.query(sql, values, (err, result) => {
     if (err) {
-      console.error('❌ Update Profile SQL Error:', err.message);
-      return res.status(500).json({ message: 'Failed to update profile information.' });
+      console.error("❌ Database update error:", err);
+      if (err.code === 'ER_DUP_ENTRY') {
+        return res.status(400).json({ message: "This email or phone number is already registered." });
+      }
+      return res.status(500).json({ message: "Failed to update profile due to a server error." });
     }
 
-    if (result.affectedRows === 0) return res.status(404).json({ message: 'User not found.' });
-    return res.status(200).json({ message: 'Profile updated successfully!' });
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "User not found or no changes made." });
+    }
+
+    res.status(200).json({ message: "Profile updated successfully!" });
   });
 });
 
