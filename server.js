@@ -715,7 +715,6 @@ app.post('/api/loans', (req, res) => {
     });
   });
 });
-
 app.post('/api/update-profile', (req, res) => {
   const { userId, firstName, lastName, email, phone } = req.body;
 
