@@ -19,13 +19,15 @@ const getMinimumInt = (value, fallback, minimum) => {
 const MPESA_BASE_URL = String(process.env.MPESA_BASE_URL || 'https://sandbox.safaricom.co.ke').replace(/\/$/, '');
 const MPESA_TIMEOUT_MS = getMinimumInt(process.env.MPESA_TIMEOUT_MS, 20000, 5000);
 const MPESA_TOKEN_RETRIES = getNonNegativeInt(process.env.MPESA_TOKEN_RETRIES, 2);
-const MPESA_STK_RETRIES = getNonNegativeInt(process.env.MPESA_STK_RETRIES, 1);
+const MPESA_STK_RETRIES = getNonNegativeInt(process.env.MPESA_STK_RETRIES, 0);
 const MPESA_RETRY_NETWORK_STK = String(process.env.MPESA_RETRY_NETWORK_STK || '').toLowerCase() === 'true';
+const MPESA_STK_DUPLICATE_WINDOW_MS = getMinimumInt(process.env.MPESA_STK_DUPLICATE_WINDOW_MS, 90000, 10000);
 const TOKEN_REFRESH_BUFFER_MS = 60 * 1000;
 
 let cachedToken = null;
 let cachedTokenExpiresAt = 0;
 let tokenRequestPromise = null;
+const recentStkRequests = new Map();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -106,6 +108,49 @@ const normalizeDarajaText = (value, fallback, maxLength) => {
 
   return cleaned.slice(0, maxLength) || fallback.slice(0, maxLength);
 };
+
+const cleanupRecentStkRequests = () => {
+  const now = Date.now();
+
+  for (const [key, entry] of recentStkRequests.entries()) {
+    if (entry.expiresAt <= now) {
+      recentStkRequests.delete(key);
+    }
+  }
+};
+
+const getRecentStkRequest = (key) => {
+  const entry = recentStkRequests.get(key);
+
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    recentStkRequests.delete(key);
+    return null;
+  }
+
+  return entry;
+};
+
+const rememberStkRequest = (key, entry) => {
+  cleanupRecentStkRequests();
+  recentStkRequests.set(key, {
+    ...entry,
+    expiresAt: Date.now() + MPESA_STK_DUPLICATE_WINDOW_MS
+  });
+};
+
+const clearRecentStkRequest = (key) => {
+  recentStkRequests.delete(key);
+};
+
+const getStkRequestKey = ({ userId, formattedPhone, amount, accountReference }) => (
+  [
+    userId || 'anonymous',
+    formattedPhone,
+    amount,
+    accountReference
+  ].join('|')
+);
 
 const getCallbackUrl = () => {
   const liveBackendUrl = String(process.env.BACKEND_URL || '').trim();
@@ -244,6 +289,7 @@ router.post('/stkpush', getMpesaToken, async (req, res) => {
   const { phoneNumber, amount, userId, accountReference, transactionDesc } = req.body;
   const token = req.mpesaToken;
   const requestId = randomUUID();
+  let duplicateKey;
 
   // Validate required inputs
   if (!phoneNumber || !amount || !accountReference) {
@@ -300,6 +346,31 @@ router.post('/stkpush', getMpesaToken, async (req, res) => {
       AccountReference: normalizeDarajaText(accountReference, 'Loan', 12),
       TransactionDesc: normalizeDarajaText(transactionDesc, "Loan Pay", 13)
     };
+    duplicateKey = getStkRequestKey({
+      userId,
+      formattedPhone,
+      amount: stkPayload.Amount,
+      accountReference: stkPayload.AccountReference
+    });
+    const recentRequest = getRecentStkRequest(duplicateKey);
+
+    if (recentRequest) {
+      console.warn(`[${requestId}] Duplicate STK Push suppressed. Existing request=${recentRequest.requestId}, status=${recentRequest.status}`);
+      return res.status(200).json({
+        message: recentRequest.checkoutRequestID
+          ? "M-Pesa prompt already sent. Check your phone for the existing prompt."
+          : "M-Pesa payment request is already being initiated. Check your phone shortly.",
+        merchantRequestID: recentRequest.merchantRequestID,
+        checkoutRequestID: recentRequest.checkoutRequestID,
+        requestId: recentRequest.requestId,
+        deduplicated: true
+      });
+    }
+
+    rememberStkRequest(duplicateKey, {
+      requestId,
+      status: 'initiating'
+    });
 
     console.log(`[${requestId}] STK Push: shortcode=${shortCode}, phone=${formattedPhone}, amount=${stkPayload.Amount}, account=${stkPayload.AccountReference}`);
 
@@ -318,6 +389,33 @@ router.post('/stkpush', getMpesaToken, async (req, res) => {
 
     if (response.data && String(response.data.ResponseCode) === '0') {
       console.log(`[${requestId}] ✅ STK Push accepted:`, response.data);
+      rememberStkRequest(duplicateKey, {
+        requestId,
+        status: 'accepted',
+        merchantRequestID: response.data.MerchantRequestID,
+        checkoutRequestID: response.data.CheckoutRequestID
+      });
+
+      if (userId) {
+        try {
+          await pool.promise().query(
+            `INSERT INTO loans (
+              user_id, loan_type, amount, transaction_type, payment_mode,
+              account_number, provider_request_id, checkout_request_id, status
+            ) VALUES (?, 'Repayment', ?, 'Repayment', 'M-Pesa', ?, ?, ?, 'Pending')`,
+            [
+              userId,
+              -Math.abs(stkPayload.Amount),
+              response.data.CheckoutRequestID || response.data.MerchantRequestID || 'Pending M-Pesa',
+              response.data.MerchantRequestID,
+              response.data.CheckoutRequestID
+            ]
+          );
+        } catch (ledgerError) {
+          console.error(`[${requestId}] M-Pesa pending ledger insert failed:`, ledgerError.message);
+        }
+      }
+
       res.status(200).json({
         message: "STK Push sent successfully! Check your phone for M-Pesa prompt.",
         merchantRequestID: response.data.MerchantRequestID,
@@ -326,6 +424,7 @@ router.post('/stkpush', getMpesaToken, async (req, res) => {
       });
     } else {
       console.error(`[${requestId}] ❌ STK Push failed - Response:`, response.data);
+      clearRecentStkRequest(duplicateKey);
       res.status(400).json({
         error: response.data?.ResponseDescription || "Failed to send STK Push",
         responseCode: response.data?.ResponseCode,
@@ -334,6 +433,9 @@ router.post('/stkpush', getMpesaToken, async (req, res) => {
     }
   } catch (error) {
     console.error(`[${requestId}] ❌ STK Push Error:`, getMpesaErrorDetails(error));
+    if (typeof duplicateKey !== 'undefined') {
+      clearRecentStkRequest(duplicateKey);
+    }
     res.status(error.statusCode || 502).json({
       error: error.publicMessage || error.response?.data?.errorMessage || error.response?.data?.ResponseDescription || "Failed to process STK Push request. Please try again.",
       providerStatus: error.response?.status,
@@ -345,15 +447,51 @@ router.post('/stkpush', getMpesaToken, async (req, res) => {
 
 router.post('/callback', async (req, res) => {
   try {
-    const callbackData = req.body.Body.stkCallback;
+    const callbackData = req.body?.Body?.stkCallback;
+
+    if (!callbackData) {
+      console.warn("⚠️ M-Pesa callback received without stkCallback payload.");
+      return res.status(200).send("Callback Received");
+    }
+
+    const merchantRequestID = callbackData.MerchantRequestID || null;
+    const checkoutRequestID = callbackData.CheckoutRequestID || null;
     
     if (callbackData.ResultCode === 0) {
-      const metadataItems = callbackData.CallbackMetadata.Item;
+      const metadataItems = callbackData.CallbackMetadata?.Item || [];
       const receipt = metadataItems.find(item => item.Name === 'MpesaReceiptNumber')?.Value;
       const amountPaid = metadataItems.find(item => item.Name === 'Amount')?.Value;
       const phone = metadataItems.find(item => item.Name === 'PhoneNumber')?.Value;
+      const parsedAmountPaid = parseFloat(amountPaid);
+      const negativeAmountOffset = Number.isFinite(parsedAmountPaid) ? -Math.abs(parsedAmountPaid) : 0;
       
       console.log(`✅ Success Callback! Received KES ${amountPaid} from ${phone}. Receipt: ${receipt}`);
+
+      const [updateResult] = await pool.promise().query(
+        `UPDATE loans
+         SET status = 'Completed',
+             amount = ?,
+             account_number = ?,
+             receipt_number = ?,
+             completed_at = NOW(),
+             failure_reason = NULL
+         WHERE transaction_type = 'Repayment'
+           AND status = 'Pending'
+           AND (checkout_request_id = ? OR provider_request_id = ?)
+         LIMIT 1`,
+        [
+          negativeAmountOffset,
+          receipt || checkoutRequestID || merchantRequestID,
+          receipt,
+          checkoutRequestID,
+          merchantRequestID
+        ]
+      );
+
+      if (updateResult.affectedRows > 0) {
+        console.log(`🎉 Pending M-Pesa repayment marked completed. Receipt: ${receipt}`);
+        return res.status(200).send("Callback Received");
+      }
       
       const lookupUserSql = "SELECT id FROM users WHERE phone LIKE ?";
       const cleanedSearchPhone = `%${String(phone).slice(-9)}`; 
@@ -363,17 +501,41 @@ router.post('/callback', async (req, res) => {
       if (userResults.length > 0) {
         const calculatedUserId = userResults[0].id;
         const recordPaymentSql = `
-          INSERT INTO loans (user_id, loan_type, amount, payment_mode, account_number, status) 
-          VALUES (?, 'Repayment', ?, 'M-Pesa', ?, 'Disbursed')
+          INSERT INTO loans (
+            user_id, loan_type, amount, transaction_type, payment_mode,
+            account_number, receipt_number, provider_request_id, checkout_request_id,
+            status, completed_at
+          ) VALUES (?, 'Repayment', ?, 'Repayment', 'M-Pesa', ?, ?, ?, ?, 'Completed', NOW())
         `;
-        const negativeAmountOffset = -Math.abs(parseFloat(amountPaid));
 
-        await pool.promise().query(recordPaymentSql, [calculatedUserId, negativeAmountOffset, receipt]);
+        await pool.promise().query(recordPaymentSql, [
+          calculatedUserId,
+          negativeAmountOffset,
+          receipt || checkoutRequestID || merchantRequestID,
+          receipt,
+          merchantRequestID,
+          checkoutRequestID
+        ]);
         console.log(`🎉 Account ID ${calculatedUserId} balance reduced by KES ${amountPaid} via MySQL ledger.`);
       } else {
         console.error("❌ Settle Failure: Payment processed but phone signature map to user record failed.");
       }
     } else {
+      await pool.promise().query(
+        `UPDATE loans
+         SET status = 'Failed',
+             failure_reason = ?,
+             completed_at = NOW()
+         WHERE transaction_type = 'Repayment'
+           AND status = 'Pending'
+           AND (checkout_request_id = ? OR provider_request_id = ?)
+         LIMIT 1`,
+        [
+          callbackData.ResultDesc || `M-Pesa callback failed with code ${callbackData.ResultCode}`,
+          checkoutRequestID,
+          merchantRequestID
+        ]
+      );
       console.log(`⚠️ Transaction declined or cancelled by user. Code: ${callbackData.ResultCode}`);
     }
   } catch (err) {

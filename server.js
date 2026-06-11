@@ -18,11 +18,29 @@ app.use(express.json());
 const promisePool = pool.promise();
 const RESET_CODE_TTL_MINUTES = parseInt(process.env.RESET_CODE_TTL_MINUTES, 10) || 15;
 const RESET_VERIFIED_TTL_MINUTES = parseInt(process.env.RESET_VERIFIED_TTL_MINUTES, 10) || 10;
+const MPESA_BASE_URL = String(process.env.MPESA_BASE_URL || 'https://sandbox.safaricom.co.ke').replace(/\/$/, '');
+const MPESA_TIMEOUT_MS = Math.max(parseInt(process.env.MPESA_TIMEOUT_MS, 10) || 20000, 5000);
+const POSTED_LEDGER_STATUS_SQL = "('Disbursed', 'Completed')";
 
 const normalizeEmail = (email = '') => String(email).trim().toLowerCase();
 const generateResetCode = () => Math.floor(1000 + Math.random() * 9000).toString();
 const getResetOtp = (value) => String(value || '').trim();
 const isValidResetOtp = (value) => /^\d{4}$/.test(value);
+const getPositiveNumber = (value, fallback = 0) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const getPositiveInt = (value, fallback = 1) => {
+  const parsed = parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const getFutureDueDate = (durationMonths) => {
+  const dueDate = new Date();
+  dueDate.setMonth(dueDate.getMonth() + durationMonths);
+  return dueDate.toISOString().slice(0, 10);
+};
 
 const ensureColumn = (table, column, definition, afterColumn) => {
   const afterClause = afterColumn ? ` AFTER ${afterColumn}` : '';
@@ -347,8 +365,19 @@ const initializeDatabase = () => {
         user_id INT NOT NULL,
         loan_type VARCHAR(255) NOT NULL,
         amount DECIMAL(10,2) NOT NULL,
+        principal_amount DECIMAL(10,2) DEFAULT NULL,
+        repayment_amount DECIMAL(10,2) DEFAULT NULL,
+        duration_months INT DEFAULT NULL,
+        interest_rate DECIMAL(5,2) DEFAULT NULL,
+        due_date DATE DEFAULT NULL,
+        transaction_type VARCHAR(50) DEFAULT NULL,
         payment_mode VARCHAR(100),
         account_number VARCHAR(100),
+        receipt_number VARCHAR(100) DEFAULT NULL,
+        provider_request_id VARCHAR(100) DEFAULT NULL,
+        checkout_request_id VARCHAR(100) DEFAULT NULL,
+        failure_reason VARCHAR(255) DEFAULT NULL,
+        completed_at DATETIME DEFAULT NULL,
         status VARCHAR(50) DEFAULT 'pending',
         date_applied TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -358,6 +387,17 @@ const initializeDatabase = () => {
         console.error("❌ Error verifying/creating loans table:", loanErr.message);
       } else {
         console.log("✅ New loans table verified/built with correct columns successfully!");
+        ensureColumn('loans', 'principal_amount', 'DECIMAL(10,2) DEFAULT NULL', 'amount');
+        ensureColumn('loans', 'repayment_amount', 'DECIMAL(10,2) DEFAULT NULL', 'principal_amount');
+        ensureColumn('loans', 'duration_months', 'INT DEFAULT NULL', 'repayment_amount');
+        ensureColumn('loans', 'interest_rate', 'DECIMAL(5,2) DEFAULT NULL', 'duration_months');
+        ensureColumn('loans', 'due_date', 'DATE DEFAULT NULL', 'interest_rate');
+        ensureColumn('loans', 'transaction_type', 'VARCHAR(50) DEFAULT NULL', 'due_date');
+        ensureColumn('loans', 'receipt_number', 'VARCHAR(100) DEFAULT NULL', 'account_number');
+        ensureColumn('loans', 'provider_request_id', 'VARCHAR(100) DEFAULT NULL', 'receipt_number');
+        ensureColumn('loans', 'checkout_request_id', 'VARCHAR(100) DEFAULT NULL', 'provider_request_id');
+        ensureColumn('loans', 'failure_reason', 'VARCHAR(255) DEFAULT NULL', 'checkout_request_id');
+        ensureColumn('loans', 'completed_at', 'DATETIME DEFAULT NULL', 'failure_reason');
       }
     });
   });
@@ -386,6 +426,7 @@ app.get('/api/health', (req, res) => {
       passKeyLoaded: hasPassKey,
       shortCodeLoaded: hasShortCode,
       shortCode: hasShortCode ? process.env.MPESA_SHORTCODE : 'NOT SET',
+      baseUrl: MPESA_BASE_URL,
       backendUrl: process.env.BACKEND_URL || 'NOT SET'
     }
   });
@@ -410,10 +451,10 @@ app.post('/api/test-mpesa-token', async (req, res) => {
     console.log("Auth header length:", auth.length);
     
     const response = await axios.get(
-      'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials',
+      `${MPESA_BASE_URL}/oauth/v1/generate?grant_type=client_credentials`,
       { 
         headers: { Authorization: `Basic ${auth}` },
-        timeout: 10000
+        timeout: MPESA_TIMEOUT_MS
       }
     );
     
@@ -485,7 +526,7 @@ app.post('/api/login', (req, res) => {
       if (!match) { 
         return res.status(401).json({ message: 'Invalid username or password!' });
       }
-      const balanceQuery = "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status = 'Disbursed'";
+      const balanceQuery = `SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status IN ${POSTED_LEDGER_STATUS_SQL}`;
       
       pool.query(balanceQuery, [user.id], (balanceErr, balanceResults) => {
         if (balanceErr) {
@@ -692,15 +733,52 @@ app.post('/api/reset-password', async (req, res) => {
 });
 
 app.post('/api/loans', (req, res) => {
-  const { userId, loanType, amount, paymentMode, accountNumber } = req.body;
-  const insertLoanQuery = "INSERT INTO loans (user_id, loan_type, amount, payment_mode, account_number, status) VALUES (?, ?, ?, ?, ?, 'Disbursed')";
-    
-  pool.query(insertLoanQuery, [userId, loanType, amount, paymentMode, accountNumber], (err, result) => {
+  const {
+    userId,
+    loanType,
+    amount,
+    paymentMode,
+    accountNumber,
+    durationMonths,
+    interestRate,
+    repaymentAmount,
+    dueDate
+  } = req.body;
+  const principalAmount = getPositiveNumber(amount);
+  const resolvedDurationMonths = getPositiveInt(durationMonths, 1);
+  const resolvedInterestRate = getPositiveNumber(interestRate);
+  const resolvedRepaymentAmount = getPositiveNumber(repaymentAmount, principalAmount);
+  const resolvedDueDate = dueDate || getFutureDueDate(resolvedDurationMonths);
+
+  if (!userId || !loanType || !principalAmount || !paymentMode || !accountNumber) {
+    return res.status(400).json({ message: "Loan request is missing required fields." });
+  }
+
+  const insertLoanQuery = `
+    INSERT INTO loans (
+      user_id, loan_type, amount, principal_amount, repayment_amount,
+      duration_months, interest_rate, due_date, transaction_type,
+      payment_mode, account_number, status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Loan Disbursement', ?, ?, 'Disbursed')
+  `;
+
+  pool.query(insertLoanQuery, [
+    userId,
+    loanType,
+    resolvedRepaymentAmount,
+    principalAmount,
+    resolvedRepaymentAmount,
+    resolvedDurationMonths,
+    resolvedInterestRate,
+    resolvedDueDate,
+    paymentMode,
+    accountNumber
+  ], (err, result) => {
     if (err) {
       console.error("❌ SQL Insert Loan Error:", err.message);
       return res.status(500).json({ message: "Failed to record loan" });
     }
-    const getNewBalanceQuery = "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status = 'Disbursed'";
+    const getNewBalanceQuery = `SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status IN ${POSTED_LEDGER_STATUS_SQL}`;
     pool.query(getNewBalanceQuery, [userId], (balanceErr, balanceResult) => {
       if (balanceErr) {
         console.error("❌ SQL Fetching New Balance Error:", balanceErr.message);
@@ -710,6 +788,11 @@ app.post('/api/loans', (req, res) => {
       const newTotalBalance = balanceResult[0].total_balance || 0;
       return res.status(200).json({
         message: "Loan processed successfully",
+        loanId: result.insertId,
+        status: 'Disbursed',
+        principalAmount,
+        repaymentAmount: resolvedRepaymentAmount,
+        dueDate: resolvedDueDate,
         newTotalBalance: parseFloat(newTotalBalance)
       });
     });
@@ -776,7 +859,30 @@ app.get('/api/transactions/:userId', async (req, res) => {
   const { userId } = req.params;
   try {
     const [transactions] = await promisePool.query(
-      `SELECT id, loan_type, amount, payment_mode, account_number, status, date_applied 
+      `SELECT
+         id,
+         loan_type,
+         amount,
+         principal_amount,
+         repayment_amount,
+         duration_months,
+         interest_rate,
+         due_date,
+         COALESCE(transaction_type, CASE WHEN amount < 0 THEN 'Repayment' ELSE 'Loan Disbursement' END) AS transaction_type,
+         payment_mode,
+         account_number,
+         receipt_number,
+         provider_request_id,
+         checkout_request_id,
+         failure_reason,
+         CASE
+           WHEN status IN ('Disbursed', 'Completed', 'Paid') THEN 'Completed'
+           WHEN status IN ('Failed', 'Cancelled', 'Declined') THEN 'Failed'
+           ELSE 'Pending'
+         END AS display_status,
+         status,
+         completed_at,
+         date_applied
        FROM loans WHERE user_id = ? ORDER BY date_applied DESC`,
       [userId]
     );
@@ -790,7 +896,7 @@ app.get('/api/balance/:userId', async (req, res) => {
   const { userId } = req.params;
   try {
     const [result] = await promisePool.query(
-      "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status = 'Disbursed'",
+      `SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status IN ${POSTED_LEDGER_STATUS_SQL}`,
       [userId]
     );
     return res.status(200).json({ loanBalance: parseFloat(result[0].total_balance || 0) });
@@ -806,8 +912,8 @@ app.get('/api/loans/:userId', (req, res) => {
     return res.status(400).json({ message: "User identification parameter missing." });
   }
 
-  const totalBorrowedSql = "SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status = 'Disbursed'";
-  const userLoansHistorySql = "SELECT id, loan_type, amount, payment_mode, status, date_applied FROM loans WHERE user_id = ? ORDER BY date_applied DESC";
+  const totalBorrowedSql = `SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status IN ${POSTED_LEDGER_STATUS_SQL}`;
+  const userLoansHistorySql = "SELECT id, loan_type, amount, principal_amount, repayment_amount, duration_months, interest_rate, due_date, payment_mode, account_number, receipt_number, status, date_applied FROM loans WHERE user_id = ? ORDER BY date_applied DESC";
   
   pool.query(totalBorrowedSql, [userId], (err, balanceResults) => {
     if (err) {
@@ -849,10 +955,51 @@ app.get('/api/admin/users', adminAuth, async (req, res) => {
   }
 });
 
+app.get('/api/admin/analytics', adminAuth, async (req, res) => {
+  try {
+    const [[userStats]] = await promisePool.query('SELECT COUNT(*) AS totalActiveUsers FROM users');
+    const [[loanStats]] = await promisePool.query(`
+      SELECT
+        COALESCE(SUM(CASE WHEN amount > 0 AND status IN ${POSTED_LEDGER_STATUS_SQL} THEN COALESCE(principal_amount, amount) ELSE 0 END), 0) AS totalDisbursed,
+        COALESCE(SUM(CASE WHEN amount < 0 AND status IN ${POSTED_LEDGER_STATUS_SQL} THEN ABS(amount) ELSE 0 END), 0) AS totalRepaid,
+        COALESCE(SUM(CASE WHEN status IN ${POSTED_LEDGER_STATUS_SQL} THEN amount ELSE 0 END), 0) AS outstandingBalance,
+        COALESCE(SUM(CASE WHEN status NOT IN ${POSTED_LEDGER_STATUS_SQL} AND amount < 0 THEN 1 ELSE 0 END), 0) AS pendingRepayments
+      FROM loans
+    `);
+    const [pendingLoanRequests] = await promisePool.query(`
+      SELECT l.id, l.loan_type, l.amount, l.principal_amount, l.repayment_amount,
+             l.duration_months, l.interest_rate, l.due_date, l.payment_mode,
+             l.account_number, l.status, l.date_applied,
+             u.first_name, u.last_name, u.email, u.phone
+      FROM loans l
+      JOIN users u ON l.user_id = u.id
+      WHERE l.amount > 0 AND l.status IN ('Pending', 'Review', 'Processing')
+      ORDER BY l.date_applied ASC
+      LIMIT 25
+    `);
+
+    res.status(200).json({
+      totalActiveUsers: Number(userStats.totalActiveUsers || 0),
+      totalDisbursed: Number(loanStats.totalDisbursed || 0),
+      totalRepaid: Number(loanStats.totalRepaid || 0),
+      outstandingBalance: Number(loanStats.outstandingBalance || 0),
+      pendingRepayments: Number(loanStats.pendingRepayments || 0),
+      pendingLoanRequests
+    });
+  } catch (error) {
+    console.error('Admin analytics error:', error.message);
+    res.status(500).json({ message: 'Failed to fetch admin analytics.' });
+  }
+});
+
 app.get('/api/admin/loans', adminAuth, async (req, res) => {
   try {
     const [loans] = await promisePool.query(`
-      SELECT l.id, l.loan_type, l.amount, l.payment_mode, l.status, l.date_applied,
+      SELECT l.id, l.loan_type, l.amount, l.principal_amount, l.repayment_amount,
+             l.duration_months, l.interest_rate, l.due_date,
+             COALESCE(l.transaction_type, CASE WHEN l.amount < 0 THEN 'Repayment' ELSE 'Loan Disbursement' END) AS transaction_type,
+             l.payment_mode, l.account_number, l.receipt_number, l.provider_request_id,
+             l.checkout_request_id, l.failure_reason, l.completed_at, l.status, l.date_applied,
              u.first_name, u.last_name, u.email, u.phone
       FROM loans l
       JOIN users u ON l.user_id = u.id
