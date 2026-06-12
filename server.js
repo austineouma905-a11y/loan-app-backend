@@ -21,6 +21,12 @@ const RESET_VERIFIED_TTL_MINUTES = parseInt(process.env.RESET_VERIFIED_TTL_MINUT
 const MPESA_BASE_URL = String(process.env.MPESA_BASE_URL || 'https://sandbox.safaricom.co.ke').replace(/\/$/, '');
 const MPESA_TIMEOUT_MS = Math.max(parseInt(process.env.MPESA_TIMEOUT_MS, 10) || 20000, 5000);
 const POSTED_LEDGER_STATUS_SQL = "('Disbursed', 'Completed')";
+const PENDING_LOAN_STATUS_SQL = "('Pending', 'Pending Approval', 'Review', 'Processing')";
+const PENDING_ACCOUNT_STATUS = 'Pending Verification';
+const VERIFIED_ACCOUNT_STATUS = 'Verified';
+const PENDING_LOAN_STATUS = 'Pending Approval';
+const DISBURSED_LOAN_STATUS = 'Disbursed';
+const REJECTED_LOAN_STATUS = 'Rejected';
 
 const normalizeEmail = (email = '') => String(email).trim().toLowerCase();
 const generateResetCode = () => Math.floor(1000 + Math.random() * 9000).toString();
@@ -34,6 +40,11 @@ const getPositiveNumber = (value, fallback = 0) => {
 const getPositiveInt = (value, fallback = 1) => {
   const parsed = parseInt(value, 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const getPositiveId = (value) => {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
 const getFutureDueDate = (durationMonths) => {
@@ -343,6 +354,9 @@ const initializeDatabase = () => {
       last_name VARCHAR(100) NOT NULL,
       email VARCHAR(150) UNIQUE NOT NULL,
       phone VARCHAR(50),
+      is_verified TINYINT(1) NOT NULL DEFAULT 0,
+      status VARCHAR(50) NOT NULL DEFAULT 'Pending Verification',
+      verified_at DATETIME DEFAULT NULL,
       password VARCHAR(255) NOT NULL,
       reset_code VARCHAR(10) DEFAULT NULL,
       reset_code_expires_at DATETIME DEFAULT NULL,
@@ -354,6 +368,9 @@ const initializeDatabase = () => {
       console.error("❌ Error verifying/creating users table:", err.message);
     } else {
       console.log("✅ Users table verified/created successfully.");
+      ensureColumn('users', 'is_verified', 'TINYINT(1) NOT NULL DEFAULT 0', 'phone');
+      ensureColumn('users', 'status', "VARCHAR(50) NOT NULL DEFAULT 'Pending Verification'", 'phone');
+      ensureColumn('users', 'verified_at', 'DATETIME DEFAULT NULL');
       ensureColumn('users', 'reset_code', 'VARCHAR(10) DEFAULT NULL', 'password');
       ensureColumn('users', 'reset_code_expires_at', 'DATETIME DEFAULT NULL');
       ensureColumn('users', 'reset_verified_until', 'DATETIME DEFAULT NULL');
@@ -494,10 +511,13 @@ app.post('/api/signup', async (req, res) => {
       }
       
       res.status(201).json({ 
-        message: "Account synchronized to MySQL successfully!",
+        message: "Account created. Admin verification is required before login.",
         loanId: `LNX-2026-${result.insertId}`,
         userId: result.insertId,
-        loanBalance: 0
+        loanBalance: 0,
+        status: PENDING_ACCOUNT_STATUS,
+        isVerified: false,
+        requiresAdminVerification: true
       });
     });
   } catch (error) {
@@ -507,7 +527,7 @@ app.post('/api/signup', async (req, res) => {
 
 app.post('/api/login', (req, res) => {
   const { email, password } = req.body;
-  const query = "SELECT id, first_name, last_name, email, phone, password FROM users WHERE email = ?";
+  const query = "SELECT id, first_name, last_name, email, phone, password, status, is_verified FROM users WHERE email = ?";
     
   pool.query(query, [email], async (err, results) => {
     if (err) {
@@ -526,6 +546,17 @@ app.post('/api/login', (req, res) => {
       if (!match) { 
         return res.status(401).json({ message: 'Invalid username or password!' });
       }
+
+      const accountVerified = Number(user.is_verified) === 1 || user.status === VERIFIED_ACCOUNT_STATUS;
+      if (!accountVerified) {
+        return res.status(403).json({
+          message: 'Your account is waiting for admin verification.',
+          status: user.status || PENDING_ACCOUNT_STATUS,
+          isVerified: false,
+          requiresAdminVerification: true
+        });
+      }
+
       const balanceQuery = `SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status IN ${POSTED_LEDGER_STATUS_SQL}`;
       
       pool.query(balanceQuery, [user.id], (balanceErr, balanceResults) => {
@@ -543,7 +574,9 @@ app.post('/api/login', (req, res) => {
           phone: user.phone,
           loanId: `LNX-2026-${user.id}`,
           userId: user.id,
-          loanBalance: parseFloat(currentBalance)
+          loanBalance: parseFloat(currentBalance),
+          status: VERIFIED_ACCOUNT_STATUS,
+          isVerified: true
         });
       });
     } catch (bcryptErr) {
@@ -759,7 +792,7 @@ app.post('/api/loans', (req, res) => {
       user_id, loan_type, amount, principal_amount, repayment_amount,
       duration_months, interest_rate, due_date, transaction_type,
       payment_mode, account_number, status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Loan Disbursement', ?, ?, 'Disbursed')
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Loan Request', ?, ?, ?)
   `;
 
   pool.query(insertLoanQuery, [
@@ -772,7 +805,8 @@ app.post('/api/loans', (req, res) => {
     resolvedInterestRate,
     resolvedDueDate,
     paymentMode,
-    accountNumber
+    accountNumber,
+    PENDING_LOAN_STATUS
   ], (err, result) => {
     if (err) {
       console.error("❌ SQL Insert Loan Error:", err.message);
@@ -787,13 +821,29 @@ app.post('/api/loans', (req, res) => {
 
       const newTotalBalance = balanceResult[0].total_balance || 0;
       return res.status(200).json({
-        message: "Loan processed successfully",
+        message: "Loan request submitted for admin review.",
         loanId: result.insertId,
-        status: 'Disbursed',
+        status: PENDING_LOAN_STATUS,
         principalAmount,
         repaymentAmount: resolvedRepaymentAmount,
         dueDate: resolvedDueDate,
-        newTotalBalance: parseFloat(newTotalBalance)
+        newTotalBalance: parseFloat(newTotalBalance),
+        loan: {
+          id: result.insertId,
+          user_id: userId,
+          loan_type: loanType,
+          amount: resolvedRepaymentAmount,
+          principal_amount: principalAmount,
+          repayment_amount: resolvedRepaymentAmount,
+          duration_months: resolvedDurationMonths,
+          interest_rate: resolvedInterestRate,
+          due_date: resolvedDueDate,
+          transaction_type: 'Loan Request',
+          payment_mode: paymentMode,
+          account_number: accountNumber,
+          status: PENDING_LOAN_STATUS,
+          date_applied: new Date().toISOString()
+        }
       });
     });
   });
@@ -877,7 +927,8 @@ app.get('/api/transactions/:userId', async (req, res) => {
          failure_reason,
          CASE
            WHEN status IN ('Disbursed', 'Completed', 'Paid') THEN 'Completed'
-           WHEN status IN ('Failed', 'Cancelled', 'Declined') THEN 'Failed'
+           WHEN status IN ('Failed', 'Cancelled', 'Declined', 'Rejected') THEN 'Failed'
+           WHEN status IN ('Pending', 'Pending Approval', 'Review', 'Processing') THEN 'Pending'
            ELSE 'Pending'
          END AS display_status,
          status,
@@ -947,11 +998,39 @@ const adminAuth = (req, res, next) => {
 app.get('/api/admin/users', adminAuth, async (req, res) => {
   try {
     const [users] = await promisePool.query(
-      'SELECT id, first_name, last_name, email, phone, createdAt FROM users ORDER BY createdAt DESC'
+      'SELECT id, first_name, last_name, email, phone, status, is_verified, verified_at, createdAt FROM users ORDER BY createdAt DESC'
     );
     res.status(200).json({ users });
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch users.' });
+  }
+});
+
+app.post('/api/admin/users/:userId/verify', adminAuth, async (req, res) => {
+  const userId = getPositiveId(req.params.userId);
+  if (!userId) {
+    return res.status(400).json({ message: 'Valid user ID is required.' });
+  }
+
+  try {
+    const [result] = await promisePool.query(
+      'UPDATE users SET is_verified = 1, status = ?, verified_at = COALESCE(verified_at, NOW()) WHERE id = ?',
+      [VERIFIED_ACCOUNT_STATUS, userId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    const [[user]] = await promisePool.query(
+      'SELECT id, first_name, last_name, email, phone, status, is_verified, verified_at, createdAt FROM users WHERE id = ?',
+      [userId]
+    );
+
+    return res.status(200).json({ message: 'User verified successfully.', user });
+  } catch (error) {
+    console.error('Admin user verification error:', error.message);
+    return res.status(500).json({ message: 'Failed to verify user.' });
   }
 });
 
@@ -973,7 +1052,7 @@ app.get('/api/admin/analytics', adminAuth, async (req, res) => {
              u.first_name, u.last_name, u.email, u.phone
       FROM loans l
       JOIN users u ON l.user_id = u.id
-      WHERE l.amount > 0 AND l.status IN ('Pending', 'Review', 'Processing')
+      WHERE l.amount > 0 AND l.status IN ${PENDING_LOAN_STATUS_SQL}
       ORDER BY l.date_applied ASC
       LIMIT 25
     `);
@@ -1008,6 +1087,87 @@ app.get('/api/admin/loans', adminAuth, async (req, res) => {
     res.status(200).json({ loans });
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch loans.' });
+  }
+});
+
+app.post('/api/admin/loans/:loanId/decision', adminAuth, async (req, res) => {
+  const loanId = getPositiveId(req.params.loanId);
+  const requestedDecision = String(req.body.decision || req.body.status || '').trim().toLowerCase();
+  const isApproval = ['approve', 'approved', 'disburse', 'disbursed'].includes(requestedDecision);
+  const isRejection = ['reject', 'rejected', 'decline', 'declined'].includes(requestedDecision);
+
+  if (!loanId) {
+    return res.status(400).json({ message: 'Valid loan ID is required.' });
+  }
+
+  if (!isApproval && !isRejection) {
+    return res.status(400).json({ message: 'Decision must be approve or reject.' });
+  }
+
+  try {
+    const [[loan]] = await promisePool.query(
+      'SELECT id, user_id, amount, status FROM loans WHERE id = ?',
+      [loanId]
+    );
+
+    if (!loan) {
+      return res.status(404).json({ message: 'Loan not found.' });
+    }
+
+    if (Number(loan.amount) <= 0) {
+      return res.status(400).json({ message: 'Only loan requests can be reviewed here.' });
+    }
+
+    const currentStatus = String(loan.status || '').trim().toLowerCase();
+    const reviewableStatuses = ['pending', 'pending approval', 'review', 'processing'];
+    if (!reviewableStatuses.includes(currentStatus)) {
+      return res.status(409).json({ message: 'Loan is not pending admin review.' });
+    }
+
+    const nextStatus = isApproval ? DISBURSED_LOAN_STATUS : REJECTED_LOAN_STATUS;
+    const failureReason = isRejection
+      ? String(req.body.reason || 'Rejected by admin').trim().slice(0, 255)
+      : null;
+
+    await promisePool.query(`
+      UPDATE loans
+      SET status = ?,
+          transaction_type = ?,
+          failure_reason = ?,
+          completed_at = NOW()
+      WHERE id = ?
+    `, [
+      nextStatus,
+      isApproval ? 'Loan Disbursement' : 'Loan Request',
+      failureReason,
+      loanId
+    ]);
+
+    const [updatedLoans] = await promisePool.query(`
+      SELECT l.id, l.loan_type, l.amount, l.principal_amount, l.repayment_amount,
+             l.duration_months, l.interest_rate, l.due_date,
+             COALESCE(l.transaction_type, CASE WHEN l.amount < 0 THEN 'Repayment' ELSE 'Loan Disbursement' END) AS transaction_type,
+             l.payment_mode, l.account_number, l.receipt_number, l.provider_request_id,
+             l.checkout_request_id, l.failure_reason, l.completed_at, l.status, l.date_applied,
+             u.first_name, u.last_name, u.email, u.phone
+      FROM loans l
+      JOIN users u ON l.user_id = u.id
+      WHERE l.id = ?
+    `, [loanId]);
+
+    const [[balance]] = await promisePool.query(
+      `SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status IN ${POSTED_LEDGER_STATUS_SQL}`,
+      [loan.user_id]
+    );
+
+    return res.status(200).json({
+      message: isApproval ? 'Loan approved and disbursed.' : 'Loan rejected.',
+      loan: updatedLoans[0],
+      loanBalance: parseFloat(balance.total_balance || 0)
+    });
+  } catch (error) {
+    console.error('Admin loan decision error:', error.message);
+    return res.status(500).json({ message: 'Failed to update loan decision.' });
   }
 });
 
