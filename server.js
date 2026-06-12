@@ -22,11 +22,58 @@ const MPESA_BASE_URL = String(process.env.MPESA_BASE_URL || 'https://sandbox.saf
 const MPESA_TIMEOUT_MS = Math.max(parseInt(process.env.MPESA_TIMEOUT_MS, 10) || 20000, 5000);
 const POSTED_LEDGER_STATUS_SQL = "('Disbursed', 'Completed')";
 const PENDING_LOAN_STATUS_SQL = "('Pending', 'Pending Approval', 'Review', 'Processing')";
-const PENDING_ACCOUNT_STATUS = 'Pending Verification';
 const VERIFIED_ACCOUNT_STATUS = 'Verified';
 const PENDING_LOAN_STATUS = 'Pending Approval';
 const DISBURSED_LOAN_STATUS = 'Disbursed';
 const REJECTED_LOAN_STATUS = 'Rejected';
+
+const databaseState = {
+  connected: false,
+  schemaReady: false,
+  checkedAt: null,
+  lastError: null
+};
+
+const getDatabaseErrorSummary = (err) => {
+  if (!err) return null;
+
+  return {
+    code: err.code,
+    errno: err.errno,
+    sqlState: err.sqlState,
+    message: err.code === 'ER_ACCESS_DENIED_ERROR' ? 'Database authentication failed.' : 'Database operation failed.',
+    hint: getDatabaseErrorHint(err)
+  };
+};
+
+const getDatabaseErrorHint = (err) => {
+  if (!err) return null;
+
+  if (err.code === 'ER_ACCESS_DENIED_ERROR' || err.errno === 1045) {
+    return 'Database login failed. Check DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, and DB_NAME in the deployed environment.';
+  }
+
+  if (err.code === 'ER_BAD_DB_ERROR' || err.errno === 1049) {
+    return 'The configured database name does not exist or this user cannot access it.';
+  }
+
+  if (['ENOTFOUND', 'ECONNREFUSED', 'ETIMEDOUT', 'PROTOCOL_CONNECTION_LOST'].includes(err.code)) {
+    return 'The database host or port is unreachable from this server.';
+  }
+
+  if (err.code === 'ER_TABLEACCESS_DENIED_ERROR' || err.code === 'ER_DBACCESS_DENIED_ERROR') {
+    return 'The database user connected, but it does not have the required permissions for this database.';
+  }
+
+  return null;
+};
+
+const setDatabaseState = (err, schemaReady = false) => {
+  databaseState.connected = !err;
+  databaseState.schemaReady = !err && schemaReady;
+  databaseState.checkedAt = new Date().toISOString();
+  databaseState.lastError = getDatabaseErrorSummary(err);
+};
 
 const normalizeEmail = (email = '') => String(email).trim().toLowerCase();
 const generateResetCode = () => Math.floor(1000 + Math.random() * 9000).toString();
@@ -53,21 +100,23 @@ const getFutureDueDate = (durationMonths) => {
   return dueDate.toISOString().slice(0, 10);
 };
 
-const ensureColumn = (table, column, definition, afterColumn) => {
+const ensureColumn = async (table, column, definition, afterColumn) => {
   const afterClause = afterColumn ? ` AFTER ${afterColumn}` : '';
-  pool.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}${afterClause}`, (err) => {
-    if (!err) {
-      console.log(`Column ${table}.${column} added successfully.`);
-      return;
-    }
 
+  try {
+    await promisePool.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}${afterClause}`);
+    console.log(`Column ${table}.${column} added successfully.`);
+  } catch (err) {
     if (err.errno === 1060 || err.code === 'ER_DUP_FIELDNAME') {
       console.log(`Column ${table}.${column} verified.`);
       return;
     }
 
+    setDatabaseState(err, false);
     console.error(`Unexpected database structure error for ${table}.${column}:`, err.message);
-  });
+    const hint = getDatabaseErrorHint(err);
+    if (hint) console.error(`Database hint: ${hint}`);
+  }
 };
 
 const cleanEnvValue = (value = '', removeWhitespace = false) => {
@@ -346,37 +395,68 @@ const sendEmail = async ({ to, subject, html }) => {
   throw lastError || createMailError('email', 'Email delivery is not configured on the server.');
 };
 
-const initializeDatabase = () => {
-  pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      first_name VARCHAR(100) NOT NULL,
-      last_name VARCHAR(100) NOT NULL,
-      email VARCHAR(150) UNIQUE NOT NULL,
-      phone VARCHAR(50),
-      is_verified TINYINT(1) NOT NULL DEFAULT 0,
-      status VARCHAR(50) NOT NULL DEFAULT 'Pending Verification',
-      verified_at DATETIME DEFAULT NULL,
-      password VARCHAR(255) NOT NULL,
-      reset_code VARCHAR(10) DEFAULT NULL,
-      reset_code_expires_at DATETIME DEFAULT NULL,
-      reset_verified_until DATETIME DEFAULT NULL,
-      createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `, (err) => {
-    if (err) {
-      console.error("❌ Error verifying/creating users table:", err.message);
-    } else {
-      console.log("✅ Users table verified/created successfully.");
-      ensureColumn('users', 'is_verified', 'TINYINT(1) NOT NULL DEFAULT 0', 'phone');
-      ensureColumn('users', 'status', "VARCHAR(50) NOT NULL DEFAULT 'Pending Verification'", 'phone');
-      ensureColumn('users', 'verified_at', 'DATETIME DEFAULT NULL');
-      ensureColumn('users', 'reset_code', 'VARCHAR(10) DEFAULT NULL', 'password');
-      ensureColumn('users', 'reset_code_expires_at', 'DATETIME DEFAULT NULL');
-      ensureColumn('users', 'reset_verified_until', 'DATETIME DEFAULT NULL');
-    }
+const initializeDatabase = async () => {
+  try {
+    await promisePool.query('SELECT 1');
+    setDatabaseState(null, false);
+    console.log('✅ Database connection verified.', pool.safeConfig);
+  } catch (err) {
+    setDatabaseState(err, false);
+    console.error('❌ Database connection failed:', err.message);
+    console.error('Database config loaded:', pool.safeConfig);
+    const hint = getDatabaseErrorHint(err);
+    if (hint) console.error(`Database hint: ${hint}`);
+    return;
+  }
 
-    pool.query(`
+  try {
+    await promisePool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        first_name VARCHAR(100) NOT NULL,
+        last_name VARCHAR(100) NOT NULL,
+        email VARCHAR(150) UNIQUE NOT NULL,
+        phone VARCHAR(50),
+        is_verified TINYINT(1) NOT NULL DEFAULT 1,
+        status VARCHAR(50) NOT NULL DEFAULT 'Verified',
+        verified_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        password VARCHAR(255) NOT NULL,
+        reset_code VARCHAR(10) DEFAULT NULL,
+        reset_code_expires_at DATETIME DEFAULT NULL,
+        reset_verified_until DATETIME DEFAULT NULL,
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('✅ Users table verified/created successfully.');
+    await ensureColumn('users', 'is_verified', 'TINYINT(1) NOT NULL DEFAULT 1', 'phone');
+    await ensureColumn('users', 'status', "VARCHAR(50) NOT NULL DEFAULT 'Verified'", 'phone');
+    await ensureColumn('users', 'verified_at', 'DATETIME DEFAULT CURRENT_TIMESTAMP');
+    await ensureColumn('users', 'reset_code', 'VARCHAR(10) DEFAULT NULL', 'password');
+    await ensureColumn('users', 'reset_code_expires_at', 'DATETIME DEFAULT NULL');
+    await ensureColumn('users', 'reset_verified_until', 'DATETIME DEFAULT NULL');
+    const [verifiedUsersResult] = await promisePool.query(
+      `UPDATE users
+       SET is_verified = 1,
+           status = ?,
+           verified_at = COALESCE(verified_at, NOW())
+       WHERE is_verified = 0
+          OR status IS NULL
+          OR status = 'Pending Verification'`,
+      [VERIFIED_ACCOUNT_STATUS]
+    );
+    if (verifiedUsersResult.affectedRows > 0) {
+      console.log(`✅ Auto-verified ${verifiedUsersResult.affectedRows} existing user account(s).`);
+    }
+  } catch (err) {
+    setDatabaseState(err, false);
+    console.error('❌ Error verifying/creating users table:', err.message);
+    const hint = getDatabaseErrorHint(err);
+    if (hint) console.error(`Database hint: ${hint}`);
+    return;
+  }
+
+  try {
+    await promisePool.query(`
       CREATE TABLE IF NOT EXISTS loans (
         id INT AUTO_INCREMENT PRIMARY KEY,
         user_id INT NOT NULL,
@@ -399,43 +479,59 @@ const initializeDatabase = () => {
         date_applied TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
       )
-    `, (loanErr) => {
-      if (loanErr) {
-        console.error("❌ Error verifying/creating loans table:", loanErr.message);
-      } else {
-        console.log("✅ New loans table verified/built with correct columns successfully!");
-        ensureColumn('loans', 'principal_amount', 'DECIMAL(10,2) DEFAULT NULL', 'amount');
-        ensureColumn('loans', 'repayment_amount', 'DECIMAL(10,2) DEFAULT NULL', 'principal_amount');
-        ensureColumn('loans', 'duration_months', 'INT DEFAULT NULL', 'repayment_amount');
-        ensureColumn('loans', 'interest_rate', 'DECIMAL(5,2) DEFAULT NULL', 'duration_months');
-        ensureColumn('loans', 'due_date', 'DATE DEFAULT NULL', 'interest_rate');
-        ensureColumn('loans', 'transaction_type', 'VARCHAR(50) DEFAULT NULL', 'due_date');
-        ensureColumn('loans', 'receipt_number', 'VARCHAR(100) DEFAULT NULL', 'account_number');
-        ensureColumn('loans', 'provider_request_id', 'VARCHAR(100) DEFAULT NULL', 'receipt_number');
-        ensureColumn('loans', 'checkout_request_id', 'VARCHAR(100) DEFAULT NULL', 'provider_request_id');
-        ensureColumn('loans', 'failure_reason', 'VARCHAR(255) DEFAULT NULL', 'checkout_request_id');
-        ensureColumn('loans', 'completed_at', 'DATETIME DEFAULT NULL', 'failure_reason');
-      }
-    });
-  });
+    `);
+    console.log('✅ New loans table verified/built with correct columns successfully!');
+    await ensureColumn('loans', 'principal_amount', 'DECIMAL(10,2) DEFAULT NULL', 'amount');
+    await ensureColumn('loans', 'repayment_amount', 'DECIMAL(10,2) DEFAULT NULL', 'principal_amount');
+    await ensureColumn('loans', 'duration_months', 'INT DEFAULT NULL', 'repayment_amount');
+    await ensureColumn('loans', 'interest_rate', 'DECIMAL(5,2) DEFAULT NULL', 'duration_months');
+    await ensureColumn('loans', 'due_date', 'DATE DEFAULT NULL', 'interest_rate');
+    await ensureColumn('loans', 'transaction_type', 'VARCHAR(50) DEFAULT NULL', 'due_date');
+    await ensureColumn('loans', 'receipt_number', 'VARCHAR(100) DEFAULT NULL', 'account_number');
+    await ensureColumn('loans', 'provider_request_id', 'VARCHAR(100) DEFAULT NULL', 'receipt_number');
+    await ensureColumn('loans', 'checkout_request_id', 'VARCHAR(100) DEFAULT NULL', 'provider_request_id');
+    await ensureColumn('loans', 'failure_reason', 'VARCHAR(255) DEFAULT NULL', 'checkout_request_id');
+    await ensureColumn('loans', 'completed_at', 'DATETIME DEFAULT NULL', 'failure_reason');
+    setDatabaseState(null, true);
+  } catch (err) {
+    setDatabaseState(err, false);
+    console.error('❌ Error verifying/creating loans table:', err.message);
+    const hint = getDatabaseErrorHint(err);
+    if (hint) console.error(`Database hint: ${hint}`);
+  }
 };
 
-initializeDatabase();
+initializeDatabase().catch((err) => {
+  setDatabaseState(err, false);
+  console.error('❌ Unexpected database initialization failure:', err.message);
+});
 
 app.use('/api/mpesa', mpesaRoutes);
 
 // Diagnostic health check endpoint
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
   const hasConsumerKey = !!String(process.env.MPESA_CONSUMER_KEY || '').trim();
   const hasConsumerSecret = !!String(process.env.MPESA_CONSUMER_SECRET || '').trim();
   const hasPassKey = !!String(process.env.MPESA_PASSKEY || '').trim();
   const hasShortCode = !!String(process.env.MPESA_SHORTCODE || '').trim();
   const emailDiagnostics = getEmailDiagnostics();
 
-  res.status(200).json({
-    status: 'OK',
+  try {
+    await promisePool.query('SELECT 1');
+    setDatabaseState(null, databaseState.schemaReady);
+  } catch (err) {
+    setDatabaseState(err, false);
+  }
+
+  res.status(databaseState.connected ? 200 : 503).json({
+    status: databaseState.connected ? 'OK' : 'DEGRADED',
     timestamp: new Date().toISOString(),
-    database: 'connected',
+    database: {
+      connected: databaseState.connected,
+      schemaReady: databaseState.schemaReady,
+      checkedAt: databaseState.checkedAt,
+      lastError: databaseState.lastError
+    },
     emailConfig: emailDiagnostics,
     mpesaConfig: {
       consumerKeyLoaded: hasConsumerKey,
@@ -493,15 +589,18 @@ app.post('/api/test-mpesa-token', async (req, res) => {
 });
 
 app.post('/api/signup', async (req, res) => {
-  console.log("👉 Registration request processing:", req.body);
   const { firstName, lastName, email, phone, password } = req.body;
+  console.log("👉 Registration request processing:", { firstName, lastName, email, phone });
   
   try {
     const saltRounds = 10;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
-    const sql = "INSERT INTO users (first_name, last_name, email, phone, password) VALUES (?, ?, ?, ?, ?)";
+    const sql = `
+      INSERT INTO users (first_name, last_name, email, phone, password, is_verified, status, verified_at)
+      VALUES (?, ?, ?, ?, ?, 1, ?, NOW())
+    `;
     
-    pool.query(sql, [firstName, lastName, email, phone, hashedPassword], (err, result) => {
+    pool.query(sql, [firstName, lastName, email, phone, hashedPassword, VERIFIED_ACCOUNT_STATUS], (err, result) => {
       if (err) {
         console.error("❌ SQL Registration Error:", err.message);
         if (err.code === 'ER_DUP_ENTRY') {
@@ -511,13 +610,13 @@ app.post('/api/signup', async (req, res) => {
       }
       
       res.status(201).json({ 
-        message: "Account created. Admin verification is required before login.",
+        message: "Account created successfully.",
         loanId: `LNX-2026-${result.insertId}`,
         userId: result.insertId,
         loanBalance: 0,
-        status: PENDING_ACCOUNT_STATUS,
-        isVerified: false,
-        requiresAdminVerification: true
+        status: VERIFIED_ACCOUNT_STATUS,
+        isVerified: true,
+        requiresAdminVerification: false
       });
     });
   } catch (error) {
@@ -547,16 +646,6 @@ app.post('/api/login', (req, res) => {
         return res.status(401).json({ message: 'Invalid username or password!' });
       }
 
-      const accountVerified = Number(user.is_verified) === 1 || user.status === VERIFIED_ACCOUNT_STATUS;
-      if (!accountVerified) {
-        return res.status(403).json({
-          message: 'Your account is waiting for admin verification.',
-          status: user.status || PENDING_ACCOUNT_STATUS,
-          isVerified: false,
-          requiresAdminVerification: true
-        });
-      }
-
       const balanceQuery = `SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status IN ${POSTED_LEDGER_STATUS_SQL}`;
       
       pool.query(balanceQuery, [user.id], (balanceErr, balanceResults) => {
@@ -576,7 +665,8 @@ app.post('/api/login', (req, res) => {
           userId: user.id,
           loanBalance: parseFloat(currentBalance),
           status: VERIFIED_ACCOUNT_STATUS,
-          isVerified: true
+          isVerified: true,
+          requiresAdminVerification: false
         });
       });
     } catch (bcryptErr) {
