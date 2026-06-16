@@ -1136,7 +1136,7 @@ app.get('/api/admin/analytics', adminAuth, async (req, res) => {
       FROM loans
     `);
     const [pendingLoanRequests] = await promisePool.query(`
-      SELECT l.id, l.loan_type, l.amount, l.principal_amount, l.repayment_amount,
+      SELECT l.id, l.user_id, l.loan_type, l.amount, l.principal_amount, l.repayment_amount,
              l.duration_months, l.interest_rate, l.due_date, l.payment_mode,
              l.account_number, l.status, l.date_applied,
              u.first_name, u.last_name, u.email, u.phone
@@ -1164,7 +1164,7 @@ app.get('/api/admin/analytics', adminAuth, async (req, res) => {
 app.get('/api/admin/loans', adminAuth, async (req, res) => {
   try {
     const [loans] = await promisePool.query(`
-      SELECT l.id, l.loan_type, l.amount, l.principal_amount, l.repayment_amount,
+      SELECT l.id, l.user_id, l.loan_type, l.amount, l.principal_amount, l.repayment_amount,
              l.duration_months, l.interest_rate, l.due_date,
              COALESCE(l.transaction_type, CASE WHEN l.amount < 0 THEN 'Repayment' ELSE 'Loan Disbursement' END) AS transaction_type,
              l.payment_mode, l.account_number, l.receipt_number, l.provider_request_id,
@@ -1234,7 +1234,7 @@ app.post('/api/admin/loans/:loanId/decision', adminAuth, async (req, res) => {
     ]);
 
     const [updatedLoans] = await promisePool.query(`
-      SELECT l.id, l.loan_type, l.amount, l.principal_amount, l.repayment_amount,
+      SELECT l.id, l.user_id, l.loan_type, l.amount, l.principal_amount, l.repayment_amount,
              l.duration_months, l.interest_rate, l.due_date,
              COALESCE(l.transaction_type, CASE WHEN l.amount < 0 THEN 'Repayment' ELSE 'Loan Disbursement' END) AS transaction_type,
              l.payment_mode, l.account_number, l.receipt_number, l.provider_request_id,
