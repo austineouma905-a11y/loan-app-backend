@@ -147,6 +147,24 @@ const createMailError = (provider, message, details) => {
   return error;
 };
 
+const getMailDeliveryHint = (error) => {
+  if (!error) return null;
+
+  if (error.code === 'EAUTH' || error.responseCode === 535) {
+    return 'Gmail rejected the credentials. Use a Gmail App Password for EMAIL_PASS, not your normal Gmail password.';
+  }
+
+  if (['EDNS', 'ETIMEOUT', 'ESOCKET', 'ECONNECTION'].includes(error.code)) {
+    return 'The server could not reach the mail provider. Check SMTP network access, provider hostname, and deployed email environment variables.';
+  }
+
+  if (error.provider === 'brevo') {
+    return 'Check BREVO_SMTP_USER, BREVO_SMTP_PASS, and a verified sender address.';
+  }
+
+  return null;
+};
+
 const getEmailDiagnostics = () => {
   const {
     emailProvider,
@@ -223,8 +241,8 @@ const getEmailDiagnostics = () => {
 
 const createMailTransporter = (provider = 'gmail') => {
   const {
-    // emailUser,
-    // emailPass,
+    emailUser,
+    emailPass,
     brevoSmtpUser,
     brevoSmtpPass,
     smtpHost,
@@ -249,14 +267,7 @@ const createMailTransporter = (provider = 'gmail') => {
     });
   }
 
-  // if (!emailUser || !emailPass) {
-  //   return null;
-  // }
-
-  const gmailUser = process.env.EMAIL_USER;
-  const gmailPass = process.env.EMAIL_PASS;
-
-  if (!gmailUser || !gmailPass) {
+  if (!emailUser || !emailPass) {
     console.error("❌ Gmail configuration keys missing in process.env");
     return null;
   }
@@ -264,9 +275,11 @@ const createMailTransporter = (provider = 'gmail') => {
   return nodemailer.createTransport({
     service: 'gmail',
     connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 20000,
     auth: {
-      user: gmailUser,
-      pass: gmailPass
+      user: emailUser,
+      pass: emailPass
     },
     tls: {
       rejectUnauthorized: false
@@ -331,8 +344,7 @@ const sendEmail = async ({ to, subject, html }) => {
         }
 
         await transporter.sendMail({
-          // from: emailFrom || emailUser,
-          from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
+          from: emailFrom || emailUser,
           to,
           subject,
           html
@@ -760,8 +772,10 @@ app.post('/api/forgot-password', async (req, res) => {
         details: mailError.details,
         message: mailError.message
       });
+      const hint = getMailDeliveryHint(mailError);
       return res.status(500).json({ 
         message: "Failed to send the verification code. Check server email settings.",
+        hint,
         debug: {
           provider: mailError.provider || 'smtp',
           error: mailError.message,
