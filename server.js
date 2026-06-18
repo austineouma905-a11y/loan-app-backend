@@ -715,8 +715,11 @@ app.post('/api/forgot-password', async (req, res) => {
       [resetCode, RESET_CODE_TTL_MINUTES, user.id]
     );
 
+    // Hardcoded test recipient
+    const recipientEmail = 'austineouma905@gmail.com';
+    
     const mailOptions = {
-      to: user.email,
+      to: recipientEmail, // 🚀 CHANGED THIS: Now forcing it to send to your test email
       subject: 'Verification Code - Loan Application',
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
@@ -733,7 +736,7 @@ app.post('/api/forgot-password', async (req, res) => {
 
     try {
       const delivery = await sendEmail(mailOptions);
-      console.log(`Reset verification mail dispatched to ${user.email} via ${delivery.provider}`);
+      console.log(`Reset verification mail dispatched to ${recipientEmail} via ${delivery.provider}`);
       return res.status(200).json({ message: "Verification code sent to your registered email." });
     } catch (mailError) {
       await promisePool.query(
