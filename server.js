@@ -223,8 +223,8 @@ const getEmailDiagnostics = () => {
 
 const createMailTransporter = (provider = 'gmail') => {
   const {
-    emailUser,
-    emailPass,
+    // emailUser,
+    // emailPass,
     brevoSmtpUser,
     brevoSmtpPass,
     smtpHost,
@@ -249,7 +249,15 @@ const createMailTransporter = (provider = 'gmail') => {
     });
   }
 
-  if (!emailUser || !emailPass) {
+  // if (!emailUser || !emailPass) {
+  //   return null;
+  // }
+
+  const gmailUser = process.env.EMAIL_USER;
+  const gmailPass = process.env.EMAIL_PASS;
+
+  if (!gmailUser || !gmailPass) {
+    console.error("❌ Gmail configuration keys missing in process.env");
     return null;
   }
 
@@ -257,8 +265,8 @@ const createMailTransporter = (provider = 'gmail') => {
     service: 'gmail',
     connectionTimeout: 10000,
     auth: {
-      user: emailUser,
-      pass: emailPass
+      user: gmailUser,
+      pass: gmailPass
     },
     tls: {
       rejectUnauthorized: false
@@ -323,7 +331,8 @@ const sendEmail = async ({ to, subject, html }) => {
         }
 
         await transporter.sendMail({
-          from: emailFrom || emailUser,
+          // from: emailFrom || emailUser,
+          from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
           to,
           subject,
           html
@@ -715,11 +724,10 @@ app.post('/api/forgot-password', async (req, res) => {
       [resetCode, RESET_CODE_TTL_MINUTES, user.id]
     );
 
-    // Hardcoded test recipient
-    const recipientEmail = 'austineouma905@gmail.com';
+    const recipientEmail = user.email;
     
     const mailOptions = {
-      to: recipientEmail, // 🚀 CHANGED THIS: Now forcing it to send to your test email
+      to: recipientEmail,
       subject: 'Verification Code - Loan Application',
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
