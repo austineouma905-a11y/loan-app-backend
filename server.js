@@ -133,6 +133,7 @@ const getEmailConfig = () => ({
   brevoSmtpUser: cleanEnvValue(process.env.BREVO_SMTP_USER),
   brevoSmtpPass: cleanEnvValue(process.env.BREVO_SMTP_PASS, true),
   brevoFrom: cleanEnvValue(process.env.BREVO_FROM || process.env.BREVO_SENDER_EMAIL),
+  resetEmailOverride: cleanEnvValue(process.env.RESET_EMAIL_OVERRIDE),
   smtpHost: cleanEnvValue(process.env.SMTP_HOST) || 'smtp-relay.brevo.com',
   smtpPort: parseInt(process.env.SMTP_PORT, 10) || 587,
   smtpSecure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true'
@@ -174,7 +175,8 @@ const getEmailDiagnostics = () => {
     resendApiKey,
     brevoSmtpUser,
     brevoSmtpPass,
-    brevoFrom
+    brevoFrom,
+    resetEmailOverride
   } = getEmailConfig();
 
   const requestedProvider = emailProvider || 'auto';
@@ -235,6 +237,7 @@ const getEmailDiagnostics = () => {
         ready: resendReady
       }
     },
+    resetEmailOverrideEnabled: Boolean(resetEmailOverride),
     issues
   };
 };
@@ -739,7 +742,11 @@ app.post('/api/forgot-password', async (req, res) => {
       [resetCode, RESET_CODE_TTL_MINUTES, user.id]
     );
 
-    const recipientEmail = user.email;
+    const { resetEmailOverride } = getEmailConfig();
+    const recipientEmail = resetEmailOverride || user.email;
+    const resetTargetNote = resetEmailOverride
+      ? `<p style="color: #7f8c8d; font-size: 13px;">This code was requested for account: <strong>${user.email}</strong></p>`
+      : '';
     
     const mailOptions = {
       to: recipientEmail,
@@ -749,6 +756,7 @@ app.post('/api/forgot-password', async (req, res) => {
           <h2 style="color: #2c3e50; text-align: center;">Secure Password Reset</h2>
           <p>Hello${user.first_name ? ` ${user.first_name}` : ''},</p>
           <p>Use this single-use verification code to reset your password:</p>
+          ${resetTargetNote}
           <div style="background-color: #f8f9fa; padding: 15px; text-align: center; font-size: 28px; font-weight: bold; letter-spacing: 6px; color: #16a085; border: 1px dashed #bdc3c7; border-radius: 4px; margin: 20px 0;">
             ${resetCode}
           </div>
