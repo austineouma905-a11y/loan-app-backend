@@ -151,6 +151,14 @@ const createMailError = (provider, message, details) => {
 const getMailDeliveryHint = (error) => {
   if (!error) return null;
 
+  if (error.provider === 'brevo' && (error.code === 'EAUTH' || error.responseCode === 535)) {
+    return 'Brevo rejected the SMTP credentials. Create a fresh SMTP key in Brevo and set BREVO_SMTP_PASS to that key.';
+  }
+
+  if (error.provider === 'brevo' && (error.responseCode === 525 || /unauthorized ip/i.test(error.message || ''))) {
+    return 'Brevo rejected this server IP. Authorize the outbound IP in Brevo SMTP settings or remove IP restrictions for the sender.';
+  }
+
   if (error.code === 'EAUTH' || error.responseCode === 535) {
     return 'Gmail rejected the credentials. Use a Gmail App Password for EMAIL_PASS, not your normal Gmail password.';
   }
@@ -405,6 +413,7 @@ const sendEmail = async ({ to, subject, html }) => {
 
       throw createMailError(candidate, `Unknown email provider: ${candidate}`);
     } catch (error) {
+      error.provider = error.provider || candidate;
       lastError = error;
       if (provider !== 'auto') throw error;
       console.error(`Email delivery via ${candidate} failed:`, {
