@@ -20,12 +20,15 @@ const RESET_CODE_TTL_MINUTES = parseInt(process.env.RESET_CODE_TTL_MINUTES, 10) 
 const RESET_VERIFIED_TTL_MINUTES = parseInt(process.env.RESET_VERIFIED_TTL_MINUTES, 10) || 10;
 const MPESA_BASE_URL = String(process.env.MPESA_BASE_URL || 'https://sandbox.safaricom.co.ke').replace(/\/$/, '');
 const MPESA_TIMEOUT_MS = Math.max(parseInt(process.env.MPESA_TIMEOUT_MS, 10) || 20000, 5000);
-const POSTED_LEDGER_STATUS_SQL = "('Disbursed', 'Completed')";
+const POSTED_LEDGER_STATUS_SQL = "('Disbursed', 'Approved', 'Active', 'Completed')";
 const PENDING_LOAN_STATUS_SQL = "('Pending', 'Pending Approval', 'Review', 'Processing')";
 const VERIFIED_ACCOUNT_STATUS = 'Verified';
 const PENDING_LOAN_STATUS = 'Pending Approval';
 const DISBURSED_LOAN_STATUS = 'Disbursed';
 const REJECTED_LOAN_STATUS = 'Rejected';
+const SHOULD_BOOTSTRAP_SCHEMA = String(
+  process.env.DB_BOOTSTRAP_SCHEMA || (process.env.NODE_ENV === 'production' ? 'false' : 'true')
+).toLowerCase() === 'true';
 
 const databaseState = {
   connected: false,
@@ -468,6 +471,32 @@ const initializeDatabase = async () => {
     return;
   }
 
+  if (!SHOULD_BOOTSTRAP_SCHEMA) {
+    try {
+      const [usersTables] = await promisePool.query("SHOW TABLES LIKE 'users'");
+      const [loansTables] = await promisePool.query("SHOW TABLES LIKE 'loans'");
+
+      if (usersTables.length === 0 || loansTables.length === 0) {
+        const schemaError = new Error(
+          'Database schema is not provisioned. Set DB_BOOTSTRAP_SCHEMA=true for a one-time local bootstrap or apply migrations manually.'
+        );
+        setDatabaseState(schemaError, false);
+        console.error('âŒ Database schema check failed:', schemaError.message);
+        return;
+      }
+
+      setDatabaseState(null, true);
+      console.log('âœ… Existing database schema detected. Schema bootstrap skipped by configuration.');
+      return;
+    } catch (schemaCheckErr) {
+      setDatabaseState(schemaCheckErr, false);
+      console.error('âŒ Database schema check failed:', schemaCheckErr.message);
+      const hint = getDatabaseErrorHint(schemaCheckErr);
+      if (hint) console.error(`Database hint: ${hint}`);
+      return;
+    }
+  }
+
   try {
     await promisePool.query(`
       CREATE TABLE IF NOT EXISTS users (
@@ -877,7 +906,7 @@ app.post('/api/verify-otp', async (req, res) => {
   }
 });
 
-// 3. RESET PASSWORD ROUTE - only works after OTP verification or with a valid OTP.
+// 3. RESET PASSWORD ROUTE - requires OTP verification.
 app.post('/api/reset-password', async (req, res) => {
   const email = normalizeEmail(req.body.email);
   const newPassword = req.body.newPassword || req.body.password;
@@ -1151,10 +1180,11 @@ app.get('/api/loans/:userId', (req, res) => {
   });
 });
 
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'admin123';
+const ADMIN_SECRET = cleanEnvValue(process.env.ADMIN_SECRET);
 
 const adminAuth = (req, res, next) => {
   const secret = req.headers['x-admin-secret'];
+  if (!ADMIN_SECRET) return res.status(401).json({ message: 'Unauthorized' });
   if (secret !== ADMIN_SECRET) return res.status(401).json({ message: 'Unauthorized' });
   next();
 };
