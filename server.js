@@ -139,7 +139,30 @@ const getEmailConfig = () => ({
   smtpSecure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true'
 });
 
+const getAdminEmails = () => {
+  const rawAdminEmails = cleanEnvValue(process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || 'austineouma905@gmail.com');
+  return rawAdminEmails
+    .split(',')
+    .map((email) => normalizeEmail(email))
+    .filter(Boolean);
+};
+
+const isAdminEmail = (email) => getAdminEmails().includes(normalizeEmail(email));
+
 const isResendTestSender = (from = '') => !from || /onboarding@resend\.dev/i.test(from);
+
+const getMailProviderPriority = (requestedProvider = 'auto') => {
+  const normalized = cleanEnvValue(requestedProvider).toLowerCase();
+
+  const orderMap = {
+    gmail: ['gmail', 'brevo', 'resend'],
+    brevo: ['brevo', 'gmail', 'resend'],
+    resend: ['resend', 'gmail', 'brevo'],
+    auto: ['gmail', 'brevo', 'resend']
+  };
+
+  return orderMap[normalized] || orderMap.auto;
+};
 
 const createMailError = (provider, message, details) => {
   const error = new Error(message);
@@ -155,6 +178,10 @@ const getMailDeliveryHint = (error) => {
     return 'Brevo rejected the SMTP credentials. Create a fresh SMTP key in Brevo and set BREVO_SMTP_PASS to that key.';
   }
 
+  if (error.provider === 'brevo' && error.code === 'ETIMEDOUT') {
+    return 'Brevo SMTP timed out from this server. Try Gmail fallback, or change Brevo SMTP to port 465 with TLS if your host blocks 587.';
+  }
+
   if (error.provider === 'brevo' && (error.responseCode === 525 || /unauthorized ip/i.test(error.message || ''))) {
     return 'Brevo rejected this server IP. Authorize the outbound IP in Brevo SMTP settings or remove IP restrictions for the sender.';
   }
@@ -163,7 +190,7 @@ const getMailDeliveryHint = (error) => {
     return 'Gmail rejected the credentials. Use a Gmail App Password for EMAIL_PASS, not your normal Gmail password.';
   }
 
-  if (['EDNS', 'ETIMEOUT', 'ESOCKET', 'ECONNECTION'].includes(error.code)) {
+  if (['EDNS', 'ETIMEDOUT', 'ETIMEOUT', 'ESOCKET', 'ECONNECTION', 'ECONNREFUSED'].includes(error.code)) {
     return 'The server could not reach the mail provider. Check SMTP network access, provider hostname, and deployed email environment variables.';
   }
 
@@ -193,32 +220,27 @@ const getEmailDiagnostics = () => {
   const brevoReady = Boolean(brevoSmtpUser && brevoSmtpPass && brevoSender);
   const gmailReady = Boolean(emailUser && emailPass);
   const resendReady = Boolean(resendApiKey && !isResendTestSender(resendFrom));
-  const canSendToAllUsers = requestedProvider === 'brevo'
-    ? brevoReady
-    : requestedProvider === 'gmail'
-      ? gmailReady
-      : requestedProvider === 'resend'
-        ? resendReady
-        : Boolean(brevoReady || gmailReady || resendReady);
-
-  let activeProvider = null;
-  if (requestedProvider === 'auto') {
-    activeProvider = brevoReady ? 'brevo' : gmailReady ? 'gmail' : resendReady ? 'resend' : null;
-  } else if (canSendToAllUsers) {
-    activeProvider = requestedProvider;
-  }
+  const readyMap = {
+    gmail: gmailReady,
+    brevo: brevoReady,
+    resend: resendReady
+  };
+  const availableProviders = getMailProviderPriority(requestedProvider).filter((provider) => readyMap[provider]);
+  const canSendToAllUsers = availableProviders.length > 0;
+  const activeProvider = availableProviders[0] || null;
 
   const issues = [];
-  const checksBrevo = requestedProvider === 'brevo' || requestedProvider === 'auto';
-  const checksResend = requestedProvider === 'resend' || requestedProvider === 'auto';
+  const preferredProviderReady = requestedProvider === 'auto'
+    ? canSendToAllUsers
+    : Boolean(readyMap[requestedProvider]);
 
-  if (checksBrevo && (!brevoSmtpUser || !brevoSmtpPass)) {
-    issues.push('Brevo SMTP credentials are missing. Set BREVO_SMTP_USER and BREVO_SMTP_PASS.');
+  if (requestedProvider === 'brevo' && !preferredProviderReady) {
+    issues.push('Brevo is the preferred provider, but its SMTP settings are incomplete. The server will fall back to another configured provider if available.');
   }
-  if (checksBrevo && brevoSmtpUser && brevoSmtpPass && !brevoSender) {
+  if (brevoSmtpUser && brevoSmtpPass && !brevoSender) {
     issues.push('Brevo SMTP is set, but EMAIL_FROM or BREVO_FROM is missing. Brevo needs a verified sender address.');
   }
-  if (checksResend && resendApiKey && isResendTestSender(resendFrom)) {
+  if (requestedProvider === 'resend' && resendApiKey && isResendTestSender(resendFrom)) {
     issues.push('Resend is using onboarding@resend.dev, which only sends to verified test recipients.');
   }
   if (!canSendToAllUsers) {
@@ -269,7 +291,7 @@ const createMailTransporter = (provider = 'gmail') => {
     return nodemailer.createTransport({
       host: smtpHost,
       port: smtpPort,
-      secure: smtpSecure,
+      secure: smtpSecure || smtpPort === 465,
       connectionTimeout: 10000,
       auth: {
         user: brevoSmtpUser,
@@ -318,13 +340,12 @@ const sendEmail = async ({ to, subject, html }) => {
   const canUseGmail = Boolean(emailUser && emailPass);
   const resendFrom = emailFrom || 'Loan App <onboarding@resend.dev>';
   const brevoFromAddress = emailFrom || brevoFrom;
-  const candidates = provider === 'auto'
-    ? [
-        canUseBrevo ? 'brevo' : null,
-        canUseGmail ? 'gmail' : null,
-        resendApiKey ? 'resend' : null
-      ].filter(Boolean)
-    : [provider];
+  const readyMap = {
+    gmail: canUseGmail,
+    brevo: canUseBrevo,
+    resend: Boolean(resendApiKey)
+  };
+  const candidates = getMailProviderPriority(provider).filter((candidate) => readyMap[candidate]);
 
   let lastError = null;
 
@@ -415,7 +436,6 @@ const sendEmail = async ({ to, subject, html }) => {
     } catch (error) {
       error.provider = error.provider || candidate;
       lastError = error;
-      if (provider !== 'auto') throw error;
       console.error(`Email delivery via ${candidate} failed:`, {
         provider: error.provider || candidate,
         code: error.code,
@@ -425,6 +445,9 @@ const sendEmail = async ({ to, subject, html }) => {
         details: error.details,
         message: error.message
       });
+      if (candidate === candidates[candidates.length - 1]) {
+        throw error;
+      }
     }
   }
 
@@ -627,6 +650,7 @@ app.post('/api/test-mpesa-token', async (req, res) => {
 app.post('/api/signup', async (req, res) => {
   const { firstName, lastName, email, phone, password } = req.body;
   console.log("👉 Registration request processing:", { firstName, lastName, email, phone });
+  const adminUser = isAdminEmail(email);
   
   try {
     const saltRounds = 10;
@@ -652,7 +676,9 @@ app.post('/api/signup', async (req, res) => {
         loanBalance: 0,
         status: VERIFIED_ACCOUNT_STATUS,
         isVerified: true,
-        requiresAdminVerification: false
+        requiresAdminVerification: false,
+        isAdmin: adminUser,
+        role: adminUser ? 'admin' : 'user'
       });
     });
   } catch (error) {
@@ -663,6 +689,7 @@ app.post('/api/signup', async (req, res) => {
 app.post('/api/login', (req, res) => {
   const { email, password } = req.body;
   const query = "SELECT id, first_name, last_name, email, phone, password, status, is_verified FROM users WHERE email = ?";
+  const adminUser = isAdminEmail(email);
     
   pool.query(query, [email], async (err, results) => {
     if (err) {
@@ -702,7 +729,9 @@ app.post('/api/login', (req, res) => {
           loanBalance: parseFloat(currentBalance),
           status: VERIFIED_ACCOUNT_STATUS,
           isVerified: true,
-          requiresAdminVerification: false
+          requiresAdminVerification: false,
+          isAdmin: adminUser,
+          role: adminUser ? 'admin' : 'user'
         });
       });
     } catch (bcryptErr) {
