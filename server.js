@@ -138,7 +138,7 @@ const getEmailConfig = () => ({
   brevoFrom: cleanEnvValue(process.env.BREVO_FROM || process.env.BREVO_SENDER_EMAIL),
   resetEmailOverride: cleanEnvValue(process.env.RESET_EMAIL_OVERRIDE),
   smtpHost: cleanEnvValue(process.env.SMTP_HOST) || 'smtp-relay.brevo.com',
-  smtpPort: parseInt(process.env.SMTP_PORT, 10) || 587,
+  smtpPort: parseInt(process.env.SMTP_PORT, 10) || 465,
   smtpSecure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true'
 });
 
@@ -214,6 +214,9 @@ const getEmailDiagnostics = () => {
     brevoSmtpUser,
     brevoSmtpPass,
     brevoFrom,
+    smtpHost,
+    smtpPort,
+    smtpSecure,
     resetEmailOverride
   } = getEmailConfig();
 
@@ -242,6 +245,12 @@ const getEmailDiagnostics = () => {
   }
   if (brevoSmtpUser && brevoSmtpPass && !brevoSender) {
     issues.push('Brevo SMTP is set, but EMAIL_FROM or BREVO_FROM is missing. Brevo needs a verified sender address.');
+  }
+  if ((process.env.EMAIL_HOST || process.env.EMAIL_PORT || process.env.EMAIL_REQUIRE_TLS || process.env.EMAIL_SECURE) && (!process.env.SMTP_HOST || !process.env.SMTP_PORT)) {
+    issues.push('Render still has legacy EMAIL_HOST/EMAIL_PORT settings, but this backend reads SMTP_HOST/SMTP_PORT/SMTP_SECURE for Brevo.');
+  }
+  if (requestedProvider === 'brevo' && smtpHost === 'smtp-relay.brevo.com' && smtpPort === 587 && !smtpSecure) {
+    issues.push('Brevo is configured on port 587 without TLS. Use SMTP_PORT=465 and SMTP_SECURE=true if your host blocks 587.');
   }
   if (requestedProvider === 'resend' && resendApiKey && isResendTestSender(resendFrom)) {
     issues.push('Resend is using onboarding@resend.dev, which only sends to verified test recipients.');
