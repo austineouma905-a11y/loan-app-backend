@@ -565,6 +565,7 @@ const initializeDatabase = async () => {
         interest_rate DECIMAL(5,2) DEFAULT NULL,
         due_date DATE DEFAULT NULL,
         transaction_type VARCHAR(50) DEFAULT NULL,
+        national_id_number VARCHAR(50) DEFAULT NULL,
         payment_mode VARCHAR(100),
         account_number VARCHAR(100),
         receipt_number VARCHAR(100) DEFAULT NULL,
@@ -584,6 +585,7 @@ const initializeDatabase = async () => {
     await ensureColumn('loans', 'interest_rate', 'DECIMAL(5,2) DEFAULT NULL', 'duration_months');
     await ensureColumn('loans', 'due_date', 'DATE DEFAULT NULL', 'interest_rate');
     await ensureColumn('loans', 'transaction_type', 'VARCHAR(50) DEFAULT NULL', 'due_date');
+    await ensureColumn('loans', 'national_id_number', 'VARCHAR(50) DEFAULT NULL', 'transaction_type');
     await ensureColumn('loans', 'receipt_number', 'VARCHAR(100) DEFAULT NULL', 'account_number');
     await ensureColumn('loans', 'provider_request_id', 'VARCHAR(100) DEFAULT NULL', 'receipt_number');
     await ensureColumn('loans', 'checkout_request_id', 'VARCHAR(100) DEFAULT NULL', 'provider_request_id');
@@ -974,18 +976,20 @@ app.post('/api/loans', (req, res) => {
     amount,
     paymentMode,
     accountNumber,
+    nationalIdNumber,
     durationMonths,
     interestRate,
     repaymentAmount,
     dueDate
   } = req.body;
+  const cleanNationalIdNumber = String(nationalIdNumber || '').trim().slice(0, 50);
   const principalAmount = getPositiveNumber(amount);
   const resolvedDurationMonths = getPositiveInt(durationMonths, 1);
   const resolvedInterestRate = getPositiveNumber(interestRate);
   const resolvedRepaymentAmount = getPositiveNumber(repaymentAmount, principalAmount);
   const resolvedDueDate = dueDate || getFutureDueDate(resolvedDurationMonths);
 
-  if (!userId || !loanType || !principalAmount || !paymentMode || !accountNumber) {
+  if (!userId || !loanType || !principalAmount || !paymentMode || !accountNumber || !cleanNationalIdNumber) {
     return res.status(400).json({ message: "Loan request is missing required fields." });
   }
 
@@ -993,8 +997,8 @@ app.post('/api/loans', (req, res) => {
     INSERT INTO loans (
       user_id, loan_type, amount, principal_amount, repayment_amount,
       duration_months, interest_rate, due_date, transaction_type,
-      payment_mode, account_number, status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Loan Request', ?, ?, ?)
+      national_id_number, payment_mode, account_number, status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Loan Request', ?, ?, ?, ?)
   `;
 
   pool.query(insertLoanQuery, [
@@ -1006,6 +1010,7 @@ app.post('/api/loans', (req, res) => {
     resolvedDurationMonths,
     resolvedInterestRate,
     resolvedDueDate,
+    cleanNationalIdNumber,
     paymentMode,
     accountNumber,
     PENDING_LOAN_STATUS
@@ -1028,6 +1033,7 @@ app.post('/api/loans', (req, res) => {
         status: PENDING_LOAN_STATUS,
         principalAmount,
         repaymentAmount: resolvedRepaymentAmount,
+        nationalIdNumber: cleanNationalIdNumber,
         dueDate: resolvedDueDate,
         newTotalBalance: parseFloat(newTotalBalance),
         loan: {
@@ -1041,6 +1047,7 @@ app.post('/api/loans', (req, res) => {
           interest_rate: resolvedInterestRate,
           due_date: resolvedDueDate,
           transaction_type: 'Loan Request',
+          national_id_number: cleanNationalIdNumber,
           payment_mode: paymentMode,
           account_number: accountNumber,
           status: PENDING_LOAN_STATUS,
@@ -1121,6 +1128,7 @@ app.get('/api/transactions/:userId', async (req, res) => {
          interest_rate,
          due_date,
          COALESCE(transaction_type, CASE WHEN amount < 0 THEN 'Repayment' ELSE 'Loan Disbursement' END) AS transaction_type,
+         national_id_number,
          payment_mode,
          account_number,
          receipt_number,
@@ -1166,7 +1174,7 @@ app.get('/api/loans/:userId', (req, res) => {
   }
 
   const totalBorrowedSql = `SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status IN ${POSTED_LEDGER_STATUS_SQL}`;
-  const userLoansHistorySql = "SELECT id, loan_type, amount, principal_amount, repayment_amount, duration_months, interest_rate, due_date, payment_mode, account_number, receipt_number, status, date_applied FROM loans WHERE user_id = ? ORDER BY date_applied DESC";
+  const userLoansHistorySql = "SELECT id, loan_type, amount, principal_amount, repayment_amount, duration_months, interest_rate, due_date, national_id_number, payment_mode, account_number, receipt_number, status, date_applied FROM loans WHERE user_id = ? ORDER BY date_applied DESC";
   
   pool.query(totalBorrowedSql, [userId], (err, balanceResults) => {
     if (err) {
@@ -1251,7 +1259,7 @@ app.get('/api/admin/analytics', adminAuth, async (req, res) => {
     const [pendingLoanRequests] = await promisePool.query(`
       SELECT l.id, l.user_id, l.loan_type, l.amount, l.principal_amount, l.repayment_amount,
              l.duration_months, l.interest_rate, l.due_date, l.payment_mode,
-             l.account_number, l.status, l.date_applied,
+             l.national_id_number, l.account_number, l.status, l.date_applied,
              u.first_name, u.last_name, u.email, u.phone
       FROM loans l
       JOIN users u ON l.user_id = u.id
@@ -1280,7 +1288,7 @@ app.get('/api/admin/loans', adminAuth, async (req, res) => {
       SELECT l.id, l.user_id, l.loan_type, l.amount, l.principal_amount, l.repayment_amount,
              l.duration_months, l.interest_rate, l.due_date,
              COALESCE(l.transaction_type, CASE WHEN l.amount < 0 THEN 'Repayment' ELSE 'Loan Disbursement' END) AS transaction_type,
-             l.payment_mode, l.account_number, l.receipt_number, l.provider_request_id,
+             l.payment_mode, l.national_id_number, l.account_number, l.receipt_number, l.provider_request_id,
              l.checkout_request_id, l.failure_reason, l.completed_at, l.status, l.date_applied,
              u.first_name, u.last_name, u.email, u.phone
       FROM loans l
@@ -1350,7 +1358,7 @@ app.post('/api/admin/loans/:loanId/decision', adminAuth, async (req, res) => {
       SELECT l.id, l.user_id, l.loan_type, l.amount, l.principal_amount, l.repayment_amount,
              l.duration_months, l.interest_rate, l.due_date,
              COALESCE(l.transaction_type, CASE WHEN l.amount < 0 THEN 'Repayment' ELSE 'Loan Disbursement' END) AS transaction_type,
-             l.payment_mode, l.account_number, l.receipt_number, l.provider_request_id,
+             l.payment_mode, l.national_id_number, l.account_number, l.receipt_number, l.provider_request_id,
              l.checkout_request_id, l.failure_reason, l.completed_at, l.status, l.date_applied,
              u.first_name, u.last_name, u.email, u.phone
       FROM loans l
