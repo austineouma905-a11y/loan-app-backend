@@ -109,17 +109,67 @@ const ensureColumn = async (table, column, definition, afterColumn) => {
   try {
     await promisePool.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}${afterClause}`);
     console.log(`Column ${table}.${column} added successfully.`);
+    return true;
   } catch (err) {
     if (err.errno === 1060 || err.code === 'ER_DUP_FIELDNAME') {
       console.log(`Column ${table}.${column} verified.`);
-      return;
+      return true;
     }
 
     setDatabaseState(err, false);
     console.error(`Unexpected database structure error for ${table}.${column}:`, err.message);
     const hint = getDatabaseErrorHint(err);
     if (hint) console.error(`Database hint: ${hint}`);
+    return false;
   }
+};
+
+const ensureUsersColumns = async () => {
+  const checks = [
+    ['users', 'is_verified', 'TINYINT(1) NOT NULL DEFAULT 1', 'phone'],
+    ['users', 'status', "VARCHAR(50) NOT NULL DEFAULT 'Verified'", 'phone'],
+    ['users', 'verified_at', 'DATETIME DEFAULT CURRENT_TIMESTAMP'],
+    ['users', 'reset_code', 'VARCHAR(10) DEFAULT NULL', 'password'],
+    ['users', 'reset_code_expires_at', 'DATETIME DEFAULT NULL'],
+    ['users', 'reset_verified_until', 'DATETIME DEFAULT NULL']
+  ];
+
+  for (const check of checks) {
+    const ready = await ensureColumn(...check);
+    if (!ready) return false;
+  }
+
+  return true;
+};
+
+const ensureLoansColumns = async () => {
+  const checks = [
+    ['loans', 'principal_amount', 'DECIMAL(10,2) DEFAULT NULL', 'amount'],
+    ['loans', 'repayment_amount', 'DECIMAL(10,2) DEFAULT NULL', 'principal_amount'],
+    ['loans', 'duration_months', 'INT DEFAULT NULL', 'repayment_amount'],
+    ['loans', 'interest_rate', 'DECIMAL(5,2) DEFAULT NULL', 'duration_months'],
+    ['loans', 'due_date', 'DATE DEFAULT NULL', 'interest_rate'],
+    ['loans', 'transaction_type', 'VARCHAR(50) DEFAULT NULL', 'due_date'],
+    ['loans', 'national_id_number', 'VARCHAR(50) DEFAULT NULL', 'transaction_type'],
+    ['loans', 'receipt_number', 'VARCHAR(100) DEFAULT NULL', 'account_number'],
+    ['loans', 'provider_request_id', 'VARCHAR(100) DEFAULT NULL', 'receipt_number'],
+    ['loans', 'checkout_request_id', 'VARCHAR(100) DEFAULT NULL', 'provider_request_id'],
+    ['loans', 'failure_reason', 'VARCHAR(255) DEFAULT NULL', 'checkout_request_id'],
+    ['loans', 'completed_at', 'DATETIME DEFAULT NULL', 'failure_reason']
+  ];
+
+  for (const check of checks) {
+    const ready = await ensureColumn(...check);
+    if (!ready) return false;
+  }
+
+  return true;
+};
+
+const ensureExistingSchemaColumns = async () => {
+  const usersReady = await ensureUsersColumns();
+  const loansReady = await ensureLoansColumns();
+  return usersReady && loansReady;
 };
 
 const cleanEnvValue = (value = '', removeWhitespace = false) => {
@@ -127,20 +177,27 @@ const cleanEnvValue = (value = '', removeWhitespace = false) => {
   return removeWhitespace ? cleaned.replace(/\s/g, '') : cleaned;
 };
 
-const getEmailConfig = () => ({
-  emailProvider: cleanEnvValue(process.env.EMAIL_PROVIDER).toLowerCase(),
-  emailUser: cleanEnvValue(process.env.EMAIL_USER),
-  emailPass: cleanEnvValue(process.env.EMAIL_PASS, true),
-  emailFrom: cleanEnvValue(process.env.EMAIL_FROM),
-  resendApiKey: cleanEnvValue(process.env.RESEND_API_KEY),
-  brevoSmtpUser: cleanEnvValue(process.env.BREVO_SMTP_USER),
-  brevoSmtpPass: cleanEnvValue(process.env.BREVO_SMTP_PASS, true),
-  brevoFrom: cleanEnvValue(process.env.BREVO_FROM || process.env.BREVO_SENDER_EMAIL),
-  resetEmailOverride: cleanEnvValue(process.env.RESET_EMAIL_OVERRIDE),
-  smtpHost: cleanEnvValue(process.env.SMTP_HOST) || 'smtp-relay.brevo.com',
-  smtpPort: parseInt(process.env.SMTP_PORT, 10) || 465,
-  smtpSecure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true'
-});
+const getEmailConfig = () => {
+  const resetEmailOverride = cleanEnvValue(process.env.RESET_EMAIL_OVERRIDE);
+  const allowResetEmailOverride = cleanEnvValue(process.env.ALLOW_RESET_EMAIL_OVERRIDE).toLowerCase() === 'true';
+
+  return {
+    emailProvider: cleanEnvValue(process.env.EMAIL_PROVIDER).toLowerCase(),
+    emailUser: cleanEnvValue(process.env.EMAIL_USER),
+    emailPass: cleanEnvValue(process.env.EMAIL_PASS, true),
+    emailFrom: cleanEnvValue(process.env.EMAIL_FROM),
+    resendApiKey: cleanEnvValue(process.env.RESEND_API_KEY),
+    brevoSmtpUser: cleanEnvValue(process.env.BREVO_SMTP_USER),
+    brevoSmtpPass: cleanEnvValue(process.env.BREVO_SMTP_PASS, true),
+    brevoFrom: cleanEnvValue(process.env.BREVO_FROM || process.env.BREVO_SENDER_EMAIL),
+    resetEmailOverride: allowResetEmailOverride ? resetEmailOverride : '',
+    resetEmailOverrideConfigured: Boolean(resetEmailOverride),
+    resetEmailOverrideAllowed: allowResetEmailOverride,
+    smtpHost: cleanEnvValue(process.env.SMTP_HOST) || 'smtp-relay.brevo.com',
+    smtpPort: parseInt(process.env.SMTP_PORT, 10) || 465,
+    smtpSecure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true'
+  };
+};
 
 const getAdminEmails = () => {
   const rawAdminEmails = cleanEnvValue(process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || 'austineouma905@gmail.com');
@@ -217,7 +274,9 @@ const getEmailDiagnostics = () => {
     smtpHost,
     smtpPort,
     smtpSecure,
-    resetEmailOverride
+    resetEmailOverride,
+    resetEmailOverrideConfigured,
+    resetEmailOverrideAllowed
   } = getEmailConfig();
 
   const requestedProvider = emailProvider || 'auto';
@@ -279,7 +338,8 @@ const getEmailDiagnostics = () => {
         ready: resendReady
       }
     },
-    resetEmailOverrideEnabled: Boolean(resetEmailOverride),
+    resetEmailOverrideConfigured,
+    resetEmailOverrideEnabled: resetEmailOverrideConfigured && resetEmailOverrideAllowed && Boolean(resetEmailOverride),
     issues
   };
 };
@@ -494,6 +554,9 @@ const initializeDatabase = async () => {
         return;
       }
 
+      const columnsReady = await ensureExistingSchemaColumns();
+      if (!columnsReady) return;
+
       setDatabaseState(null, true);
       console.log('âœ… Existing database schema detected. Schema bootstrap skipped by configuration.');
       return;
@@ -525,12 +588,8 @@ const initializeDatabase = async () => {
       )
     `);
     console.log('✅ Users table verified/created successfully.');
-    await ensureColumn('users', 'is_verified', 'TINYINT(1) NOT NULL DEFAULT 1', 'phone');
-    await ensureColumn('users', 'status', "VARCHAR(50) NOT NULL DEFAULT 'Verified'", 'phone');
-    await ensureColumn('users', 'verified_at', 'DATETIME DEFAULT CURRENT_TIMESTAMP');
-    await ensureColumn('users', 'reset_code', 'VARCHAR(10) DEFAULT NULL', 'password');
-    await ensureColumn('users', 'reset_code_expires_at', 'DATETIME DEFAULT NULL');
-    await ensureColumn('users', 'reset_verified_until', 'DATETIME DEFAULT NULL');
+    const usersColumnsReady = await ensureUsersColumns();
+    if (!usersColumnsReady) return;
     const [verifiedUsersResult] = await promisePool.query(
       `UPDATE users
        SET is_verified = 1,
@@ -579,19 +638,8 @@ const initializeDatabase = async () => {
       )
     `);
     console.log('✅ New loans table verified/built with correct columns successfully!');
-    await ensureColumn('loans', 'principal_amount', 'DECIMAL(10,2) DEFAULT NULL', 'amount');
-    await ensureColumn('loans', 'repayment_amount', 'DECIMAL(10,2) DEFAULT NULL', 'principal_amount');
-    await ensureColumn('loans', 'duration_months', 'INT DEFAULT NULL', 'repayment_amount');
-    await ensureColumn('loans', 'interest_rate', 'DECIMAL(5,2) DEFAULT NULL', 'duration_months');
-    await ensureColumn('loans', 'due_date', 'DATE DEFAULT NULL', 'interest_rate');
-    await ensureColumn('loans', 'transaction_type', 'VARCHAR(50) DEFAULT NULL', 'due_date');
-    await ensureColumn('loans', 'national_id_number', 'VARCHAR(50) DEFAULT NULL', 'transaction_type');
-    await ensureColumn('loans', 'receipt_number', 'VARCHAR(100) DEFAULT NULL', 'account_number');
-    await ensureColumn('loans', 'provider_request_id', 'VARCHAR(100) DEFAULT NULL', 'receipt_number');
-    await ensureColumn('loans', 'checkout_request_id', 'VARCHAR(100) DEFAULT NULL', 'provider_request_id');
-    await ensureColumn('loans', 'failure_reason', 'VARCHAR(255) DEFAULT NULL', 'checkout_request_id');
-    await ensureColumn('loans', 'completed_at', 'DATETIME DEFAULT NULL', 'failure_reason');
-    setDatabaseState(null, true);
+    const loansColumnsReady = await ensureLoansColumns();
+    setDatabaseState(null, loansColumnsReady);
   } catch (err) {
     setDatabaseState(err, false);
     console.error('❌ Error verifying/creating loans table:', err.message);
