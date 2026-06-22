@@ -79,6 +79,9 @@ const setDatabaseState = (err, schemaReady = false) => {
 };
 
 const normalizeEmail = (email = '') => String(email).trim().toLowerCase();
+const normalizeTextField = (value = '') => String(value || '').trim();
+const normalizePhoneField = (value = '') => normalizeTextField(value).replace(/\s+/g, '');
+const getUserName = (user = {}) => `${user.first_name || ''} ${user.last_name || ''}`.trim();
 const generateResetCode = () => Math.floor(1000 + Math.random() * 9000).toString();
 const getResetOtp = (value) => String(value || '').trim();
 const isValidResetOtp = (value) => /^\d{4}$/.test(value);
@@ -736,18 +739,26 @@ app.post('/api/test-mpesa-token', async (req, res) => {
 });
 
 app.post('/api/signup', async (req, res) => {
-  const { firstName, lastName, email, phone, password } = req.body;
+  const firstName = normalizeTextField(req.body.firstName || req.body.first_name);
+  const lastName = normalizeTextField(req.body.lastName || req.body.last_name);
+  const email = normalizeEmail(req.body.email);
+  const phone = normalizePhoneField(req.body.phone);
+  const { password } = req.body;
   console.log("👉 Registration request processing:", { firstName, lastName, email, phone });
   const adminUser = isAdminEmail(email);
   
   try {
+    if (!firstName || !lastName || !email || !phone || !password) {
+      return res.status(400).json({ message: "First name, last name, email, phone, and password are required." });
+    }
+
     const saltRounds = 10;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
     const sql = `
       INSERT INTO users (first_name, last_name, email, phone, password, is_verified, status, verified_at)
       VALUES (?, ?, ?, ?, ?, 1, ?, NOW())
     `;
-    
+
     pool.query(sql, [firstName, lastName, email, phone, hashedPassword, VERIFIED_ACCOUNT_STATUS], (err, result) => {
       if (err) {
         console.error("❌ SQL Registration Error:", err.message);
@@ -759,6 +770,11 @@ app.post('/api/signup', async (req, res) => {
       
       res.status(201).json({ 
         message: "Account created successfully.",
+        firstName,
+        lastName,
+        name: `${firstName} ${lastName}`.trim(),
+        email,
+        phone,
         loanId: `LNX-2026-${result.insertId}`,
         userId: result.insertId,
         loanBalance: 0,
@@ -779,7 +795,7 @@ app.post('/api/login', (req, res) => {
   const { password } = req.body;
   const query = "SELECT id, first_name, last_name, email, phone, password, status, is_verified FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1";
   const adminUser = isAdminEmail(email);
-    
+
   pool.query(query, [email], async (err, results) => {
     if (err) {
       console.error("❌ SQL Authentication Error:", err.message);
@@ -812,7 +828,7 @@ app.post('/api/login', (req, res) => {
           message: 'Login authorized via MySQL!',
           firstName: user.first_name || '',
           lastName: user.last_name || '',
-          name: `${user.first_name || ''} ${user.last_name || ''}`.trim(),
+          name: getUserName(user),
           email: user.email,
           phone: user.phone,
           loanId: `LNX-2026-${user.id}`,
@@ -1109,7 +1125,11 @@ app.post('/api/loans', (req, res) => {
   });
 });
 app.post('/api/update-profile', (req, res) => {
-  const { userId, firstName, lastName, email, phone } = req.body;
+  const { userId } = req.body;
+  const firstName = normalizeTextField(req.body.firstName || req.body.first_name);
+  const lastName = normalizeTextField(req.body.lastName || req.body.last_name);
+  const email = normalizeEmail(req.body.email);
+  const phone = normalizePhoneField(req.body.phone);
 
   if (!userId || !firstName || !lastName || !email || !phone) {
     return res.status(400).json({ message: "All profile fields are required." });
@@ -1260,7 +1280,7 @@ const adminAuth = (req, res, next) => {
 app.get('/api/admin/users', adminAuth, async (req, res) => {
   try {
     const [users] = await promisePool.query(
-      'SELECT id, first_name, last_name, email, phone, status, is_verified, verified_at, createdAt FROM users ORDER BY createdAt DESC'
+      "SELECT id, first_name, last_name, CONCAT_WS(' ', first_name, last_name) AS name, email, phone, status, is_verified, verified_at, createdAt FROM users ORDER BY createdAt DESC"
     );
     res.status(200).json({ users });
   } catch (error) {
@@ -1285,7 +1305,7 @@ app.post('/api/admin/users/:userId/verify', adminAuth, async (req, res) => {
     }
 
     const [[user]] = await promisePool.query(
-      'SELECT id, first_name, last_name, email, phone, status, is_verified, verified_at, createdAt FROM users WHERE id = ?',
+      "SELECT id, first_name, last_name, CONCAT_WS(' ', first_name, last_name) AS name, email, phone, status, is_verified, verified_at, createdAt FROM users WHERE id = ?",
       [userId]
     );
 
@@ -1311,7 +1331,7 @@ app.get('/api/admin/analytics', adminAuth, async (req, res) => {
       SELECT l.id, l.user_id, l.loan_type, l.amount, l.principal_amount, l.repayment_amount,
              l.duration_months, l.interest_rate, l.due_date, l.payment_mode,
              l.national_id_number, l.account_number, l.status, l.date_applied,
-             u.first_name, u.last_name, u.email, u.phone
+             u.first_name, u.last_name, CONCAT_WS(' ', u.first_name, u.last_name) AS name, u.email, u.phone
       FROM loans l
       JOIN users u ON l.user_id = u.id
       WHERE l.amount > 0 AND l.status IN ${PENDING_LOAN_STATUS_SQL}
@@ -1341,7 +1361,7 @@ app.get('/api/admin/loans', adminAuth, async (req, res) => {
              COALESCE(l.transaction_type, CASE WHEN l.amount < 0 THEN 'Repayment' ELSE 'Loan Disbursement' END) AS transaction_type,
              l.payment_mode, l.national_id_number, l.account_number, l.receipt_number, l.provider_request_id,
              l.checkout_request_id, l.failure_reason, l.completed_at, l.status, l.date_applied,
-             u.first_name, u.last_name, u.email, u.phone
+             u.first_name, u.last_name, CONCAT_WS(' ', u.first_name, u.last_name) AS name, u.email, u.phone
       FROM loans l
       JOIN users u ON l.user_id = u.id
       ORDER BY l.date_applied DESC
