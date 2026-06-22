@@ -23,6 +23,7 @@ const MPESA_TIMEOUT_MS = Math.max(parseInt(process.env.MPESA_TIMEOUT_MS, 10) || 
 const POSTED_LEDGER_STATUS_SQL = "('Disbursed', 'Approved', 'Active', 'Completed')";
 const PENDING_LOAN_STATUS_SQL = "('Pending', 'Pending Approval', 'Review', 'Processing')";
 const VERIFIED_ACCOUNT_STATUS = 'Verified';
+const PENDING_ACCOUNT_STATUS = 'Pending Verification';
 const PENDING_LOAN_STATUS = 'Pending Approval';
 const DISBURSED_LOAN_STATUS = 'Disbursed';
 const REJECTED_LOAN_STATUS = 'Rejected';
@@ -598,9 +599,7 @@ const initializeDatabase = async () => {
        SET is_verified = 1,
            status = ?,
            verified_at = COALESCE(verified_at, NOW())
-       WHERE is_verified = 0
-          OR status IS NULL
-          OR status = 'Pending Verification'`,
+       WHERE status IS NULL`,
       [VERIFIED_ACCOUNT_STATUS]
     );
     if (verifiedUsersResult.affectedRows > 0) {
@@ -746,6 +745,8 @@ app.post('/api/signup', async (req, res) => {
   const { password } = req.body;
   console.log("👉 Registration request processing:", { firstName, lastName, email, phone });
   const adminUser = isAdminEmail(email);
+  const initialStatus = adminUser ? VERIFIED_ACCOUNT_STATUS : PENDING_ACCOUNT_STATUS;
+  const isInitiallyVerified = adminUser ? 1 : 0;
   
   try {
     if (!firstName || !lastName || !email || !phone || !password) {
@@ -756,10 +757,10 @@ app.post('/api/signup', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, saltRounds);
     const sql = `
       INSERT INTO users (first_name, last_name, email, phone, password, is_verified, status, verified_at)
-      VALUES (?, ?, ?, ?, ?, 1, ?, NOW())
+      VALUES (?, ?, ?, ?, ?, ?, ?, ${adminUser ? 'NOW()' : 'NULL'})
     `;
 
-    pool.query(sql, [firstName, lastName, email, phone, hashedPassword, VERIFIED_ACCOUNT_STATUS], (err, result) => {
+    pool.query(sql, [firstName, lastName, email, phone, hashedPassword, isInitiallyVerified, initialStatus], (err, result) => {
       if (err) {
         console.error("❌ SQL Registration Error:", err.message);
         if (err.code === 'ER_DUP_ENTRY') {
@@ -769,7 +770,9 @@ app.post('/api/signup', async (req, res) => {
       }
       
       res.status(201).json({ 
-        message: "Account created successfully.",
+        message: adminUser
+          ? "Account created successfully."
+          : "Account created successfully and is waiting for admin verification.",
         firstName,
         lastName,
         name: `${firstName} ${lastName}`.trim(),
@@ -778,9 +781,10 @@ app.post('/api/signup', async (req, res) => {
         loanId: `LNX-2026-${result.insertId}`,
         userId: result.insertId,
         loanBalance: 0,
-        status: VERIFIED_ACCOUNT_STATUS,
-        isVerified: true,
-        requiresAdminVerification: false,
+        status: initialStatus,
+        isVerified: Boolean(isInitiallyVerified),
+        is_verified: isInitiallyVerified,
+        requiresAdminVerification: !isInitiallyVerified,
         isAdmin: adminUser,
         role: adminUser ? 'admin' : 'user'
       });
@@ -814,6 +818,19 @@ app.post('/api/login', (req, res) => {
         return res.status(401).json({ message: 'Invalid username or password!' });
       }
 
+      const isVerified = adminUser || Number(user.is_verified) === 1;
+      const statusText = String(user.status || '').trim().toLowerCase();
+      const isPendingVerification = !isVerified || statusText.includes('pending') || statusText.includes('unverified');
+
+      if (!adminUser && isPendingVerification) {
+        return res.status(403).json({
+          message: 'Your account is waiting for admin verification before login.',
+          status: user.status || PENDING_ACCOUNT_STATUS,
+          isVerified: false,
+          requiresAdminVerification: true
+        });
+      }
+
       const balanceQuery = `SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status IN ${POSTED_LEDGER_STATUS_SQL}`;
       
       pool.query(balanceQuery, [user.id], (balanceErr, balanceResults) => {
@@ -834,8 +851,9 @@ app.post('/api/login', (req, res) => {
           loanId: `LNX-2026-${user.id}`,
           userId: user.id,
           loanBalance: parseFloat(currentBalance),
-          status: VERIFIED_ACCOUNT_STATUS,
+          status: user.status || VERIFIED_ACCOUNT_STATUS,
           isVerified: true,
+          is_verified: 1,
           requiresAdminVerification: false,
           isAdmin: adminUser,
           role: adminUser ? 'admin' : 'user'
