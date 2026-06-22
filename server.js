@@ -727,8 +727,9 @@ app.post('/api/signup', async (req, res) => {
 });
 
 app.post('/api/login', (req, res) => {
-  const { email, password } = req.body;
-  const query = "SELECT id, first_name, last_name, email, phone, password, status, is_verified FROM users WHERE email = ?";
+  const email = normalizeEmail(req.body.email);
+  const { password } = req.body;
+  const query = "SELECT id, first_name, last_name, email, phone, password, status, is_verified FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1";
   const adminUser = isAdminEmail(email);
     
   pool.query(query, [email], async (err, results) => {
@@ -761,7 +762,9 @@ app.post('/api/login', (req, res) => {
 
         res.status(200).json({
           message: 'Login authorized via MySQL!',
-          name: `${user.first_name} ${user.last_name}`,
+          firstName: user.first_name || '',
+          lastName: user.last_name || '',
+          name: `${user.first_name || ''} ${user.last_name || ''}`.trim(),
           email: user.email,
           phone: user.phone,
           loanId: `LNX-2026-${user.id}`,
@@ -1200,9 +1203,9 @@ app.get('/api/loans/:userId', (req, res) => {
 const ADMIN_SECRET = cleanEnvValue(process.env.ADMIN_SECRET);
 
 const adminAuth = (req, res, next) => {
-  const secret = req.headers['x-admin-secret'];
-  if (!ADMIN_SECRET) return res.status(401).json({ message: 'Unauthorized' });
-  if (secret !== ADMIN_SECRET) return res.status(401).json({ message: 'Unauthorized' });
+  const secret = cleanEnvValue(req.headers['x-admin-secret']);
+  if (!ADMIN_SECRET) return res.status(401).json({ message: 'Admin access is not configured.' });
+  if (secret !== ADMIN_SECRET) return res.status(401).json({ message: 'Wrong admin password.' });
   next();
 };
 
