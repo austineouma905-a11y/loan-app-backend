@@ -23,7 +23,6 @@ const MPESA_TIMEOUT_MS = Math.max(parseInt(process.env.MPESA_TIMEOUT_MS, 10) || 
 const POSTED_LEDGER_STATUS_SQL = "('Disbursed', 'Approved', 'Active', 'Completed')";
 const PENDING_LOAN_STATUS_SQL = "('Pending', 'Pending Approval', 'Review', 'Processing')";
 const VERIFIED_ACCOUNT_STATUS = 'Verified';
-const PENDING_ACCOUNT_STATUS = 'Pending Verification';
 const PENDING_LOAN_STATUS = 'Pending Approval';
 const DISBURSED_LOAN_STATUS = 'Disbursed';
 const REJECTED_LOAN_STATUS = 'Rejected';
@@ -184,6 +183,8 @@ const cleanEnvValue = (value = '', removeWhitespace = false) => {
 const getEmailConfig = () => {
   const resetEmailOverride = cleanEnvValue(process.env.RESET_EMAIL_OVERRIDE);
   const allowResetEmailOverride = cleanEnvValue(process.env.ALLOW_RESET_EMAIL_OVERRIDE).toLowerCase() === 'true';
+  const smtpPort = parseInt(process.env.SMTP_PORT || process.env.EMAIL_PORT, 10) || 465;
+  const smtpSecureValue = process.env.SMTP_SECURE ?? process.env.EMAIL_SECURE ?? '';
 
   return {
     emailProvider: cleanEnvValue(process.env.EMAIL_PROVIDER).toLowerCase(),
@@ -197,9 +198,9 @@ const getEmailConfig = () => {
     resetEmailOverride: allowResetEmailOverride ? resetEmailOverride : '',
     resetEmailOverrideConfigured: Boolean(resetEmailOverride),
     resetEmailOverrideAllowed: allowResetEmailOverride,
-    smtpHost: cleanEnvValue(process.env.SMTP_HOST) || 'smtp-relay.brevo.com',
-    smtpPort: parseInt(process.env.SMTP_PORT, 10) || 465,
-    smtpSecure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true'
+    smtpHost: cleanEnvValue(process.env.SMTP_HOST || process.env.EMAIL_HOST) || 'smtp-relay.brevo.com',
+    smtpPort,
+    smtpSecure: String(smtpSecureValue).toLowerCase() === 'true' || smtpPort === 465
   };
 };
 
@@ -309,9 +310,6 @@ const getEmailDiagnostics = () => {
   if (brevoSmtpUser && brevoSmtpPass && !brevoSender) {
     issues.push('Brevo SMTP is set, but EMAIL_FROM or BREVO_FROM is missing. Brevo needs a verified sender address.');
   }
-  if ((process.env.EMAIL_HOST || process.env.EMAIL_PORT || process.env.EMAIL_REQUIRE_TLS || process.env.EMAIL_SECURE) && (!process.env.SMTP_HOST || !process.env.SMTP_PORT)) {
-    issues.push('Render still has legacy EMAIL_HOST/EMAIL_PORT settings, but this backend reads SMTP_HOST/SMTP_PORT/SMTP_SECURE for Brevo.');
-  }
   if (requestedProvider === 'brevo' && smtpHost === 'smtp-relay.brevo.com' && smtpPort === 587 && !smtpSecure) {
     issues.push('Brevo is configured on port 587 without TLS. Use SMTP_PORT=465 and SMTP_SECURE=true if your host blocks 587.');
   }
@@ -412,14 +410,14 @@ const sendEmail = async ({ to, subject, html }) => {
   } = getEmailConfig();
 
   const provider = emailProvider || 'auto';
-  const canUseBrevo = Boolean(brevoSmtpUser && brevoSmtpPass);
+  const canUseBrevo = Boolean(brevoSmtpUser && brevoSmtpPass && (emailFrom || brevoFrom));
   const canUseGmail = Boolean(emailUser && emailPass);
   const resendFrom = emailFrom || 'Loan App <onboarding@resend.dev>';
   const brevoFromAddress = emailFrom || brevoFrom;
   const readyMap = {
     gmail: canUseGmail,
     brevo: canUseBrevo,
-    resend: Boolean(resendApiKey)
+    resend: Boolean(resendApiKey && !isResendTestSender(resendFrom))
   };
   const candidates = getMailProviderPriority(provider).filter((candidate) => readyMap[candidate]);
 
@@ -599,7 +597,9 @@ const initializeDatabase = async () => {
        SET is_verified = 1,
            status = ?,
            verified_at = COALESCE(verified_at, NOW())
-       WHERE status IS NULL`,
+       WHERE is_verified = 0
+          OR status IS NULL
+          OR status = 'Pending Verification'`,
       [VERIFIED_ACCOUNT_STATUS]
     );
     if (verifiedUsersResult.affectedRows > 0) {
@@ -745,8 +745,6 @@ app.post('/api/signup', async (req, res) => {
   const { password } = req.body;
   console.log("👉 Registration request processing:", { firstName, lastName, email, phone });
   const adminUser = isAdminEmail(email);
-  const initialStatus = adminUser ? VERIFIED_ACCOUNT_STATUS : PENDING_ACCOUNT_STATUS;
-  const isInitiallyVerified = adminUser ? 1 : 0;
   
   try {
     if (!firstName || !lastName || !email || !phone || !password) {
@@ -757,10 +755,10 @@ app.post('/api/signup', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, saltRounds);
     const sql = `
       INSERT INTO users (first_name, last_name, email, phone, password, is_verified, status, verified_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ${adminUser ? 'NOW()' : 'NULL'})
+      VALUES (?, ?, ?, ?, ?, 1, ?, NOW())
     `;
 
-    pool.query(sql, [firstName, lastName, email, phone, hashedPassword, isInitiallyVerified, initialStatus], (err, result) => {
+    pool.query(sql, [firstName, lastName, email, phone, hashedPassword, VERIFIED_ACCOUNT_STATUS], (err, result) => {
       if (err) {
         console.error("❌ SQL Registration Error:", err.message);
         if (err.code === 'ER_DUP_ENTRY') {
@@ -770,9 +768,7 @@ app.post('/api/signup', async (req, res) => {
       }
       
       res.status(201).json({ 
-        message: adminUser
-          ? "Account created successfully."
-          : "Account created successfully and is waiting for admin verification.",
+        message: "Account created successfully.",
         firstName,
         lastName,
         name: `${firstName} ${lastName}`.trim(),
@@ -781,10 +777,9 @@ app.post('/api/signup', async (req, res) => {
         loanId: `LNX-2026-${result.insertId}`,
         userId: result.insertId,
         loanBalance: 0,
-        status: initialStatus,
-        isVerified: Boolean(isInitiallyVerified),
-        is_verified: isInitiallyVerified,
-        requiresAdminVerification: !isInitiallyVerified,
+        status: VERIFIED_ACCOUNT_STATUS,
+        isVerified: true,
+        requiresAdminVerification: false,
         isAdmin: adminUser,
         role: adminUser ? 'admin' : 'user'
       });
@@ -818,19 +813,6 @@ app.post('/api/login', (req, res) => {
         return res.status(401).json({ message: 'Invalid username or password!' });
       }
 
-      const isVerified = adminUser || Number(user.is_verified) === 1;
-      const statusText = String(user.status || '').trim().toLowerCase();
-      const isPendingVerification = !isVerified || statusText.includes('pending') || statusText.includes('unverified');
-
-      if (!adminUser && isPendingVerification) {
-        return res.status(403).json({
-          message: 'Your account is waiting for admin verification before login.',
-          status: user.status || PENDING_ACCOUNT_STATUS,
-          isVerified: false,
-          requiresAdminVerification: true
-        });
-      }
-
       const balanceQuery = `SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status IN ${POSTED_LEDGER_STATUS_SQL}`;
       
       pool.query(balanceQuery, [user.id], (balanceErr, balanceResults) => {
@@ -851,9 +833,8 @@ app.post('/api/login', (req, res) => {
           loanId: `LNX-2026-${user.id}`,
           userId: user.id,
           loanBalance: parseFloat(currentBalance),
-          status: user.status || VERIFIED_ACCOUNT_STATUS,
+          status: VERIFIED_ACCOUNT_STATUS,
           isVerified: true,
-          is_verified: 1,
           requiresAdminVerification: false,
           isAdmin: adminUser,
           role: adminUser ? 'admin' : 'user'
