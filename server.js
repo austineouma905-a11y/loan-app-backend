@@ -221,7 +221,7 @@ const getMailProviderPriority = (requestedProvider = 'auto') => {
 
   const orderMap = {
     gmail: ['gmail', 'brevo', 'resend'],
-    brevo: ['gmail', 'brevo', 'resend'],
+    brevo: ['gmail'],
     resend: ['resend', 'gmail', 'brevo'],
     auto: ['gmail', 'brevo', 'resend']
   };
