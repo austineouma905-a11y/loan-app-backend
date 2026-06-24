@@ -221,9 +221,9 @@ const getMailProviderPriority = (requestedProvider = 'auto') => {
 
   const orderMap = {
     gmail: ['gmail'],
-    brevo: ['gmail'],
+    brevo: ['brevo', 'gmail'],
     resend: ['resend', 'gmail'],
-    auto: ['gmail', 'resend']
+    auto: ['brevo', 'gmail', 'resend']
   };
 
   return orderMap[normalized] || orderMap.auto;
@@ -416,7 +416,7 @@ const sendEmail = async ({ to, subject, html }) => {
   const brevoFromAddress = emailFrom || brevoFrom;
   const readyMap = {
     gmail: canUseGmail,
-    brevo: false,
+    brevo: canUseBrevo,
     resend: Boolean(resendApiKey && !isResendTestSender(resendFrom))
   };
   const candidates = getMailProviderPriority(provider).filter((candidate) => readyMap[candidate]);
