@@ -192,6 +192,7 @@ const getEmailConfig = () => {
     emailPass: cleanEnvValue(process.env.EMAIL_PASS, true),
     emailFrom: cleanEnvValue(process.env.EMAIL_FROM),
     resendApiKey: cleanEnvValue(process.env.RESEND_API_KEY),
+    brevoApiKey: cleanEnvValue(process.env.BREVO_API_KEY, true),
     brevoSmtpUser: cleanEnvValue(process.env.BREVO_SMTP_USER),
     brevoSmtpPass: cleanEnvValue(process.env.BREVO_SMTP_PASS, true),
     brevoFrom: cleanEnvValue(process.env.BREVO_FROM || process.env.BREVO_SENDER_EMAIL),
@@ -236,6 +237,21 @@ const createMailError = (provider, message, details) => {
   return error;
 };
 
+const parseEmailAddress = (value = '') => {
+  const cleaned = cleanEnvValue(value);
+  const match = cleaned.match(/^(.*?)\s*<([^>]+)>$/);
+
+  if (!match) {
+    return { email: cleaned };
+  }
+
+  const name = match[1].trim().replace(/^['"]|['"]$/g, '');
+  return {
+    name,
+    email: match[2].trim()
+  };
+};
+
 const getMailDeliveryHint = (error) => {
   if (!error) return null;
 
@@ -273,6 +289,7 @@ const getEmailDiagnostics = () => {
     emailPass,
     emailFrom,
     resendApiKey,
+    brevoApiKey,
     brevoSmtpUser,
     brevoSmtpPass,
     brevoFrom,
@@ -287,7 +304,9 @@ const getEmailDiagnostics = () => {
   const requestedProvider = emailProvider || 'auto';
   const brevoSender = emailFrom || brevoFrom;
   const resendFrom = emailFrom || 'Loan App <onboarding@resend.dev>';
-  const brevoReady = Boolean(brevoSmtpUser && brevoSmtpPass && brevoSender);
+  const brevoApiReady = Boolean(brevoApiKey && brevoSender);
+  const brevoSmtpReady = Boolean(brevoSmtpUser && brevoSmtpPass && brevoSender);
+  const brevoReady = brevoApiReady || brevoSmtpReady;
   const gmailReady = Boolean(emailUser && emailPass);
   const resendReady = Boolean(resendApiKey && !isResendTestSender(resendFrom));
   const readyMap = {
@@ -326,7 +345,8 @@ const getEmailDiagnostics = () => {
     canSendToAllUsers,
     providers: {
       brevo: {
-        credentialsLoaded: Boolean(brevoSmtpUser && brevoSmtpPass),
+        apiKeyLoaded: Boolean(brevoApiKey),
+        smtpCredentialsLoaded: Boolean(brevoSmtpUser && brevoSmtpPass),
         senderConfigured: Boolean(brevoSender),
         ready: brevoReady
       },
@@ -404,13 +424,16 @@ const sendEmail = async ({ to, subject, html }) => {
     emailPass,
     emailFrom,
     resendApiKey,
+    brevoApiKey,
     brevoSmtpUser,
     brevoSmtpPass,
     brevoFrom
   } = getEmailConfig();
 
   const provider = emailProvider || 'auto';
-  const canUseBrevo = Boolean(brevoSmtpUser && brevoSmtpPass && (emailFrom || brevoFrom));
+  const canUseBrevoApi = Boolean(brevoApiKey && (emailFrom || brevoFrom));
+  const canUseBrevoSmtp = Boolean(brevoSmtpUser && brevoSmtpPass && (emailFrom || brevoFrom));
+  const canUseBrevo = canUseBrevoApi || canUseBrevoSmtp;
   const canUseGmail = Boolean(emailUser && emailPass);
   const resendFrom = emailFrom || 'Loan App <onboarding@resend.dev>';
   const brevoFromAddress = emailFrom || brevoFrom;
@@ -426,13 +449,52 @@ const sendEmail = async ({ to, subject, html }) => {
   for (const candidate of candidates) {
     try {
       if (candidate === 'brevo') {
+        if (!brevoFromAddress) {
+          throw createMailError('brevo', 'Brevo needs EMAIL_FROM or BREVO_FROM set to a verified sender address.');
+        }
+
+        if (canUseBrevoApi) {
+          const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+            method: 'POST',
+            headers: {
+              'api-key': brevoApiKey,
+              'Content-Type': 'application/json',
+              Accept: 'application/json'
+            },
+            body: JSON.stringify({
+              sender: parseEmailAddress(brevoFromAddress),
+              to: [{ email: to }],
+              subject,
+              htmlContent: html
+            })
+          });
+
+          const responseBody = await response.text();
+          let payload = {};
+
+          try {
+            payload = responseBody ? JSON.parse(responseBody) : {};
+          } catch (parseError) {
+            payload = { message: responseBody };
+          }
+
+          if (!response.ok) {
+            const error = createMailError(
+              'brevo',
+              payload.message || `Brevo API failed with status ${response.status}`,
+              payload
+            );
+            error.status = response.status;
+            throw error;
+          }
+
+          return { provider: 'brevo-api', id: payload.messageId };
+        }
+
         const transporter = createMailTransporter('brevo');
 
         if (!transporter) {
           throw createMailError('brevo', 'Brevo SMTP delivery is not configured on the server.');
-        }
-        if (!brevoFromAddress) {
-          throw createMailError('brevo', 'Brevo needs EMAIL_FROM or BREVO_FROM set to a verified sender address.');
         }
 
         await transporter.sendMail({
