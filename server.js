@@ -966,12 +966,16 @@ app.post('/api/login', (req, res) => {
       const balanceQuery = USER_BALANCE_SQL;
       
       pool.query(balanceQuery, [user.id, user.id, user.id], (balanceErr, balanceResults) => {
+        let currentBalance = 0;
+        let balanceStatus = 'loaded';
         if (balanceErr) {
           console.error("❌ SQL Balance Query Error:", balanceErr.message);
-          return res.status(500).json({ message: 'Failed to balance account summaries.' });
+          balanceStatus = 'unavailable';
         }
 
-        const currentBalance = balanceResults[0].total_balance || 0;
+        if (!balanceErr) {
+          currentBalance = balanceResults[0].total_balance || 0;
+        }
 
         res.status(200).json({
           message: 'Login authorized via MySQL!',
@@ -983,6 +987,7 @@ app.post('/api/login', (req, res) => {
           loanId: `LNX-2026-${user.id}`,
           userId: user.id,
           loanBalance: parseFloat(currentBalance),
+          balanceStatus,
           status: VERIFIED_ACCOUNT_STATUS,
           isVerified: true,
           requiresAdminVerification: false,

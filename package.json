@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "migrate:repayments": "node scripts/migrate-repayments.js"
   },
   "dependencies": {
     "axios": "^1.17.0",
