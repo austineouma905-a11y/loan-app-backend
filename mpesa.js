@@ -399,13 +399,13 @@ router.post('/stkpush', getMpesaToken, async (req, res) => {
       if (userId) {
         try {
           await pool.promise().query(
-            `INSERT INTO loans (
-              user_id, loan_type, amount, transaction_type, payment_mode,
-              account_number, provider_request_id, checkout_request_id, status
-            ) VALUES (?, 'Repayment', ?, 'Repayment', 'M-Pesa', ?, ?, ?, 'Pending')`,
+            `INSERT INTO repayments (
+              user_id, amount, payment_mode, account_number,
+              provider_request_id, checkout_request_id, status
+            ) VALUES (?, ?, 'M-Pesa', ?, ?, ?, 'Pending')`,
             [
               userId,
-              -Math.abs(stkPayload.Amount),
+              Math.abs(stkPayload.Amount),
               response.data.CheckoutRequestID || response.data.MerchantRequestID || 'Pending M-Pesa',
               response.data.MerchantRequestID,
               response.data.CheckoutRequestID
@@ -463,24 +463,23 @@ router.post('/callback', async (req, res) => {
       const amountPaid = metadataItems.find(item => item.Name === 'Amount')?.Value;
       const phone = metadataItems.find(item => item.Name === 'PhoneNumber')?.Value;
       const parsedAmountPaid = parseFloat(amountPaid);
-      const negativeAmountOffset = Number.isFinite(parsedAmountPaid) ? -Math.abs(parsedAmountPaid) : 0;
+      const paidAmount = Number.isFinite(parsedAmountPaid) ? Math.abs(parsedAmountPaid) : 0;
       
       console.log(`✅ Success Callback! Received KES ${amountPaid} from ${phone}. Receipt: ${receipt}`);
 
       const [updateResult] = await pool.promise().query(
-        `UPDATE loans
+        `UPDATE repayments
          SET status = 'Completed',
              amount = ?,
              account_number = ?,
              receipt_number = ?,
              completed_at = NOW(),
              failure_reason = NULL
-         WHERE transaction_type = 'Repayment'
-           AND status = 'Pending'
+         WHERE status = 'Pending'
            AND (checkout_request_id = ? OR provider_request_id = ?)
          LIMIT 1`,
         [
-          negativeAmountOffset,
+          paidAmount,
           receipt || checkoutRequestID || merchantRequestID,
           receipt,
           checkoutRequestID,
@@ -501,16 +500,16 @@ router.post('/callback', async (req, res) => {
       if (userResults.length > 0) {
         const calculatedUserId = userResults[0].id;
         const recordPaymentSql = `
-          INSERT INTO loans (
-            user_id, loan_type, amount, transaction_type, payment_mode,
+          INSERT INTO repayments (
+            user_id, amount, payment_mode,
             account_number, receipt_number, provider_request_id, checkout_request_id,
             status, completed_at
-          ) VALUES (?, 'Repayment', ?, 'Repayment', 'M-Pesa', ?, ?, ?, ?, 'Completed', NOW())
+          ) VALUES (?, ?, 'M-Pesa', ?, ?, ?, ?, 'Completed', NOW())
         `;
 
         await pool.promise().query(recordPaymentSql, [
           calculatedUserId,
-          negativeAmountOffset,
+          paidAmount,
           receipt || checkoutRequestID || merchantRequestID,
           receipt,
           merchantRequestID,
@@ -522,12 +521,11 @@ router.post('/callback', async (req, res) => {
       }
     } else {
       await pool.promise().query(
-        `UPDATE loans
+        `UPDATE repayments
          SET status = 'Failed',
              failure_reason = ?,
              completed_at = NOW()
-         WHERE transaction_type = 'Repayment'
-           AND status = 'Pending'
+         WHERE status = 'Pending'
            AND (checkout_request_id = ? OR provider_request_id = ?)
          LIMIT 1`,
         [

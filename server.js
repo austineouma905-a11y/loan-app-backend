@@ -22,6 +22,31 @@ const MPESA_BASE_URL = String(process.env.MPESA_BASE_URL || 'https://sandbox.saf
 const MPESA_TIMEOUT_MS = Math.max(parseInt(process.env.MPESA_TIMEOUT_MS, 10) || 20000, 5000);
 const POSTED_LEDGER_STATUS_SQL = "('Disbursed', 'Approved', 'Active', 'Completed')";
 const PENDING_LOAN_STATUS_SQL = "('Pending', 'Pending Approval', 'Review', 'Processing')";
+const COMPLETED_REPAYMENT_STATUS_SQL = "('Completed', 'Paid')";
+const PENDING_REPAYMENT_STATUS_SQL = "('Pending', 'Processing')";
+const USER_BALANCE_SQL = `
+  SELECT
+    COALESCE((
+      SELECT SUM(amount)
+      FROM loans
+      WHERE user_id = ?
+        AND amount > 0
+        AND status IN ${POSTED_LEDGER_STATUS_SQL}
+    ), 0)
+    - COALESCE((
+      SELECT SUM(amount)
+      FROM repayments
+      WHERE user_id = ?
+        AND status IN ${COMPLETED_REPAYMENT_STATUS_SQL}
+    ), 0)
+    + COALESCE((
+      SELECT SUM(amount)
+      FROM loans
+      WHERE user_id = ?
+        AND amount < 0
+        AND status IN ${POSTED_LEDGER_STATUS_SQL}
+    ), 0) AS total_balance
+`;
 const VERIFIED_ACCOUNT_STATUS = 'Verified';
 const PENDING_LOAN_STATUS = 'Pending Approval';
 const DISBURSED_LOAN_STATUS = 'Disbursed';
@@ -81,6 +106,9 @@ const setDatabaseState = (err, schemaReady = false) => {
 const normalizeEmail = (email = '') => String(email).trim().toLowerCase();
 const normalizeTextField = (value = '') => String(value || '').trim();
 const normalizePhoneField = (value = '') => normalizeTextField(value).replace(/\s+/g, '');
+const normalizeDigitsOnly = (value = '') => normalizeTextField(value).replace(/\D/g, '');
+const isValidDigitsOnly = (value = '') => /^\d+$/.test(String(value || ''));
+const isValidKenyanNationalId = (value = '') => /^\d{8,9}$/.test(String(value || ''));
 const getUserName = (user = {}) => `${user.first_name || ''} ${user.last_name || ''}`.trim();
 const generateResetCode = () => Math.floor(1000 + Math.random() * 9000).toString();
 const getResetOtp = (value) => String(value || '').trim();
@@ -169,10 +197,34 @@ const ensureLoansColumns = async () => {
   return true;
 };
 
+const ensureRepaymentsColumns = async () => {
+  const checks = [
+    ['repayments', 'loan_id', 'INT DEFAULT NULL', 'user_id'],
+    ['repayments', 'amount', 'DECIMAL(10,2) NOT NULL', 'loan_id'],
+    ['repayments', 'payment_mode', "VARCHAR(100) DEFAULT 'M-Pesa'", 'amount'],
+    ['repayments', 'account_number', 'VARCHAR(100) DEFAULT NULL', 'payment_mode'],
+    ['repayments', 'receipt_number', 'VARCHAR(100) DEFAULT NULL', 'account_number'],
+    ['repayments', 'provider_request_id', 'VARCHAR(100) DEFAULT NULL', 'receipt_number'],
+    ['repayments', 'checkout_request_id', 'VARCHAR(100) DEFAULT NULL', 'provider_request_id'],
+    ['repayments', 'failure_reason', 'VARCHAR(255) DEFAULT NULL', 'checkout_request_id'],
+    ['repayments', 'status', "VARCHAR(50) DEFAULT 'Pending'", 'failure_reason'],
+    ['repayments', 'completed_at', 'DATETIME DEFAULT NULL', 'status'],
+    ['repayments', 'created_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', 'completed_at']
+  ];
+
+  for (const check of checks) {
+    const ready = await ensureColumn(...check);
+    if (!ready) return false;
+  }
+
+  return true;
+};
+
 const ensureExistingSchemaColumns = async () => {
   const usersReady = await ensureUsersColumns();
   const loansReady = await ensureLoansColumns();
-  return usersReady && loansReady;
+  const repaymentsReady = await ensureRepaymentsColumns();
+  return usersReady && loansReady && repaymentsReady;
 };
 
 const cleanEnvValue = (value = '', removeWhitespace = false) => {
@@ -608,8 +660,9 @@ const initializeDatabase = async () => {
     try {
       const [usersTables] = await promisePool.query("SHOW TABLES LIKE 'users'");
       const [loansTables] = await promisePool.query("SHOW TABLES LIKE 'loans'");
+      const [repaymentsTables] = await promisePool.query("SHOW TABLES LIKE 'repayments'");
 
-      if (usersTables.length === 0 || loansTables.length === 0) {
+      if (usersTables.length === 0 || loansTables.length === 0 || repaymentsTables.length === 0) {
         const schemaError = new Error(
           'Database schema is not provisioned. Set DB_BOOTSTRAP_SCHEMA=true for a one-time local bootstrap or apply migrations manually.'
         );
@@ -703,10 +756,41 @@ const initializeDatabase = async () => {
     `);
     console.log('✅ New loans table verified/built with correct columns successfully!');
     const loansColumnsReady = await ensureLoansColumns();
-    setDatabaseState(null, loansColumnsReady);
+    if (!loansColumnsReady) return;
   } catch (err) {
     setDatabaseState(err, false);
     console.error('❌ Error verifying/creating loans table:', err.message);
+    const hint = getDatabaseErrorHint(err);
+    if (hint) console.error(`Database hint: ${hint}`);
+    return;
+  }
+
+  try {
+    await promisePool.query(`
+      CREATE TABLE IF NOT EXISTS repayments (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        loan_id INT DEFAULT NULL,
+        amount DECIMAL(10,2) NOT NULL,
+        payment_mode VARCHAR(100) DEFAULT 'M-Pesa',
+        account_number VARCHAR(100) DEFAULT NULL,
+        receipt_number VARCHAR(100) DEFAULT NULL,
+        provider_request_id VARCHAR(100) DEFAULT NULL,
+        checkout_request_id VARCHAR(100) DEFAULT NULL,
+        failure_reason VARCHAR(255) DEFAULT NULL,
+        status VARCHAR(50) DEFAULT 'Pending',
+        completed_at DATETIME DEFAULT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (loan_id) REFERENCES loans(id) ON DELETE SET NULL
+      )
+    `);
+    console.log('Repayments table verified/created successfully.');
+    const repaymentsColumnsReady = await ensureRepaymentsColumns();
+    setDatabaseState(null, repaymentsColumnsReady);
+  } catch (err) {
+    setDatabaseState(err, false);
+    console.error('Error verifying/creating repayments table:', err.message);
     const hint = getDatabaseErrorHint(err);
     if (hint) console.error(`Database hint: ${hint}`);
   }
@@ -813,6 +897,10 @@ app.post('/api/signup', async (req, res) => {
       return res.status(400).json({ message: "First name, last name, email, phone, and password are required." });
     }
 
+    if (!isValidDigitsOnly(phone)) {
+      return res.status(400).json({ message: "Phone number must contain numbers only." });
+    }
+
     const saltRounds = 10;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
     const sql = `
@@ -875,9 +963,9 @@ app.post('/api/login', (req, res) => {
         return res.status(401).json({ message: 'Invalid username or password!' });
       }
 
-      const balanceQuery = `SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status IN ${POSTED_LEDGER_STATUS_SQL}`;
+      const balanceQuery = USER_BALANCE_SQL;
       
-      pool.query(balanceQuery, [user.id], (balanceErr, balanceResults) => {
+      pool.query(balanceQuery, [user.id, user.id, user.id], (balanceErr, balanceResults) => {
         if (balanceErr) {
           console.error("❌ SQL Balance Query Error:", balanceErr.message);
           return res.status(500).json({ message: 'Failed to balance account summaries.' });
@@ -1097,7 +1185,7 @@ app.post('/api/reset-password', async (req, res) => {
   }
 });
 
-app.post('/api/loans', (req, res) => {
+app.post('/api/loans', async (req, res) => {
   const {
     userId,
     loanType,
@@ -1110,15 +1198,24 @@ app.post('/api/loans', (req, res) => {
     repaymentAmount,
     dueDate
   } = req.body;
-  const cleanNationalIdNumber = String(nationalIdNumber || '').trim().slice(0, 50);
+  const cleanNationalIdNumber = normalizeDigitsOnly(nationalIdNumber);
+  const cleanAccountNumber = normalizeTextField(accountNumber);
   const principalAmount = getPositiveNumber(amount);
   const resolvedDurationMonths = getPositiveInt(durationMonths, 1);
   const resolvedInterestRate = getPositiveNumber(interestRate);
   const resolvedRepaymentAmount = getPositiveNumber(repaymentAmount, principalAmount);
   const resolvedDueDate = dueDate || getFutureDueDate(resolvedDurationMonths);
 
-  if (!userId || !loanType || !principalAmount || !paymentMode || !accountNumber || !cleanNationalIdNumber) {
+  if (!userId || !loanType || !principalAmount || !paymentMode || !cleanAccountNumber || !cleanNationalIdNumber) {
     return res.status(400).json({ message: "Loan request is missing required fields." });
+  }
+
+  if (!isValidKenyanNationalId(cleanNationalIdNumber)) {
+    return res.status(400).json({ message: "ID number must contain exactly 8 or 9 digits." });
+  }
+
+  if (String(paymentMode).toLowerCase() === 'mobile' && !isValidDigitsOnly(cleanAccountNumber)) {
+    return res.status(400).json({ message: "Mobile number must contain numbers only." });
   }
 
   const insertLoanQuery = `
@@ -1128,6 +1225,64 @@ app.post('/api/loans', (req, res) => {
       national_id_number, payment_mode, account_number, status
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Loan Request', ?, ?, ?, ?)
   `;
+
+  try {
+    const [[pendingLoan]] = await promisePool.query(
+      `SELECT id
+       FROM loans
+       WHERE user_id = ?
+         AND amount > 0
+         AND status IN ${PENDING_LOAN_STATUS_SQL}
+       LIMIT 1`,
+      [userId]
+    );
+
+    if (pendingLoan) {
+      return res.status(409).json({ message: "You already have a pending loan request awaiting admin review." });
+    }
+
+    const [[previousLoan]] = await promisePool.query(
+      `SELECT id, repayment_amount, amount, date_applied
+       FROM loans
+       WHERE user_id = ?
+         AND amount > 0
+         AND status IN ${POSTED_LEDGER_STATUS_SQL}
+       ORDER BY COALESCE(completed_at, date_applied) DESC, id DESC
+       LIMIT 1`,
+      [userId]
+    );
+
+    if (previousLoan) {
+      const previousRepaymentTotal = Number(previousLoan.repayment_amount || previousLoan.amount || 0);
+      const requiredHalfPayment = previousRepaymentTotal / 2;
+      const [[repaymentTotals]] = await promisePool.query(
+        `SELECT
+           COALESCE(SUM(CASE WHEN r.status IN ${COMPLETED_REPAYMENT_STATUS_SQL} THEN r.amount ELSE 0 END), 0)
+           + COALESCE((
+             SELECT SUM(ABS(l.amount))
+             FROM loans l
+             WHERE l.user_id = ?
+               AND l.amount < 0
+               AND l.status IN ${POSTED_LEDGER_STATUS_SQL}
+               AND l.date_applied >= ?
+           ), 0) AS repaid_after_previous_loan
+         FROM repayments r
+         WHERE r.user_id = ?
+           AND r.created_at >= ?`,
+        [userId, previousLoan.date_applied, userId, previousLoan.date_applied]
+      );
+      const repaidAfterPreviousLoan = Number(repaymentTotals.repaid_after_previous_loan || 0);
+
+      if (previousRepaymentTotal > 0 && repaidAfterPreviousLoan < requiredHalfPayment) {
+        return res.status(409).json({
+          message: `Please repay at least half of your previous loan before borrowing again. Minimum required: KES ${requiredHalfPayment.toFixed(2)}; repaid so far: KES ${repaidAfterPreviousLoan.toFixed(2)}.`
+        });
+      }
+    }
+  } catch (err) {
+    console.error("SQL Loan Eligibility Error:", err.message);
+    return res.status(500).json({ message: "Failed to verify loan eligibility." });
+  }
 
   pool.query(insertLoanQuery, [
     userId,
@@ -1140,15 +1295,15 @@ app.post('/api/loans', (req, res) => {
     resolvedDueDate,
     cleanNationalIdNumber,
     paymentMode,
-    accountNumber,
+    cleanAccountNumber,
     PENDING_LOAN_STATUS
   ], (err, result) => {
     if (err) {
       console.error("❌ SQL Insert Loan Error:", err.message);
       return res.status(500).json({ message: "Failed to record loan" });
     }
-    const getNewBalanceQuery = `SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status IN ${POSTED_LEDGER_STATUS_SQL}`;
-    pool.query(getNewBalanceQuery, [userId], (balanceErr, balanceResult) => {
+    const getNewBalanceQuery = USER_BALANCE_SQL;
+    pool.query(getNewBalanceQuery, [userId, userId, userId], (balanceErr, balanceResult) => {
       if (balanceErr) {
         console.error("❌ SQL Fetching New Balance Error:", balanceErr.message);
         return res.status(500).json({ message: "Loan saved, but failed to fetch updated balance details." });
@@ -1177,7 +1332,7 @@ app.post('/api/loans', (req, res) => {
           transaction_type: 'Loan Request',
           national_id_number: cleanNationalIdNumber,
           payment_mode: paymentMode,
-          account_number: accountNumber,
+          account_number: cleanAccountNumber,
           status: PENDING_LOAN_STATUS,
           date_applied: new Date().toISOString()
         }
@@ -1194,6 +1349,10 @@ app.post('/api/update-profile', (req, res) => {
 
   if (!userId || !firstName || !lastName || !email || !phone) {
     return res.status(400).json({ message: "All profile fields are required." });
+  }
+
+  if (!isValidDigitsOnly(phone)) {
+    return res.status(400).json({ message: "Phone number must contain numbers only." });
   }
 
   const sql = `
@@ -1250,7 +1409,10 @@ app.get('/api/transactions/:userId', async (req, res) => {
   const { userId } = req.params;
   try {
     const [transactions] = await promisePool.query(
-      `SELECT
+      `SELECT *
+       FROM (
+       SELECT
+         CONCAT('loan-', id) AS transaction_id,
          id,
          loan_type,
          amount,
@@ -1276,8 +1438,41 @@ app.get('/api/transactions/:userId', async (req, res) => {
          status,
          completed_at,
          date_applied
-       FROM loans WHERE user_id = ? ORDER BY date_applied DESC`,
-      [userId]
+       FROM loans
+       WHERE user_id = ?
+       UNION ALL
+       SELECT
+         CONCAT('repayment-', r.id) AS transaction_id,
+         r.id,
+         'Repayment' AS loan_type,
+         -ABS(r.amount) AS amount,
+         NULL AS principal_amount,
+         NULL AS repayment_amount,
+         NULL AS duration_months,
+         NULL AS interest_rate,
+         NULL AS due_date,
+         'Repayment' AS transaction_type,
+         NULL AS national_id_number,
+         r.payment_mode,
+         r.account_number,
+         r.receipt_number,
+         r.provider_request_id,
+         r.checkout_request_id,
+         r.failure_reason,
+         CASE
+           WHEN r.status IN ('Completed', 'Paid') THEN 'Completed'
+           WHEN r.status IN ('Failed', 'Cancelled', 'Declined', 'Rejected') THEN 'Failed'
+           WHEN r.status IN ('Pending', 'Processing') THEN 'Pending'
+           ELSE 'Pending'
+         END AS display_status,
+         r.status,
+         r.completed_at,
+         r.created_at AS date_applied
+       FROM repayments r
+       WHERE r.user_id = ?
+       ) transactions
+       ORDER BY date_applied DESC`,
+      [userId, userId]
     );
     return res.status(200).json({ transactions });
   } catch (error) {
@@ -1289,8 +1484,8 @@ app.get('/api/balance/:userId', async (req, res) => {
   const { userId } = req.params;
   try {
     const [result] = await promisePool.query(
-      `SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status IN ${POSTED_LEDGER_STATUS_SQL}`,
-      [userId]
+      USER_BALANCE_SQL,
+      [userId, userId, userId]
     );
     return res.status(200).json({ loanBalance: parseFloat(result[0].total_balance || 0) });
   } catch (error) {
@@ -1305,10 +1500,10 @@ app.get('/api/loans/:userId', (req, res) => {
     return res.status(400).json({ message: "User identification parameter missing." });
   }
 
-  const totalBorrowedSql = `SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status IN ${POSTED_LEDGER_STATUS_SQL}`;
-  const userLoansHistorySql = "SELECT id, loan_type, amount, principal_amount, repayment_amount, duration_months, interest_rate, due_date, national_id_number, payment_mode, account_number, receipt_number, status, date_applied FROM loans WHERE user_id = ? ORDER BY date_applied DESC";
+  const totalBorrowedSql = USER_BALANCE_SQL;
+  const userLoansHistorySql = "SELECT id, loan_type, amount, principal_amount, repayment_amount, duration_months, interest_rate, due_date, national_id_number, payment_mode, account_number, receipt_number, status, date_applied FROM loans WHERE user_id = ? AND amount >= 0 AND COALESCE(transaction_type, '') <> 'Repayment' ORDER BY date_applied DESC";
   
-  pool.query(totalBorrowedSql, [userId], (err, balanceResults) => {
+  pool.query(totalBorrowedSql, [userId, userId, userId], (err, balanceResults) => {
     if (err) {
       console.error("❌ Error calculating aggregated totals:", err.message);
       return res.status(500).json({ message: "Database execution failure on total balance." });
@@ -1382,11 +1577,16 @@ app.get('/api/admin/analytics', adminAuth, async (req, res) => {
     const [[userStats]] = await promisePool.query('SELECT COUNT(*) AS totalActiveUsers FROM users');
     const [[loanStats]] = await promisePool.query(`
       SELECT
+        COALESCE(SUM(CASE WHEN amount > 0 AND status IN ${POSTED_LEDGER_STATUS_SQL} THEN amount ELSE 0 END), 0) AS postedLoanBalance,
         COALESCE(SUM(CASE WHEN amount > 0 AND status IN ${POSTED_LEDGER_STATUS_SQL} THEN COALESCE(principal_amount, amount) ELSE 0 END), 0) AS totalDisbursed,
-        COALESCE(SUM(CASE WHEN amount < 0 AND status IN ${POSTED_LEDGER_STATUS_SQL} THEN ABS(amount) ELSE 0 END), 0) AS totalRepaid,
-        COALESCE(SUM(CASE WHEN status IN ${POSTED_LEDGER_STATUS_SQL} THEN amount ELSE 0 END), 0) AS outstandingBalance,
-        COALESCE(SUM(CASE WHEN status NOT IN ${POSTED_LEDGER_STATUS_SQL} AND amount < 0 THEN 1 ELSE 0 END), 0) AS pendingRepayments
+        COALESCE(SUM(CASE WHEN amount < 0 AND status IN ${POSTED_LEDGER_STATUS_SQL} THEN ABS(amount) ELSE 0 END), 0) AS legacyRepaid
       FROM loans
+    `);
+    const [[repaymentStats]] = await promisePool.query(`
+      SELECT
+        COALESCE(SUM(CASE WHEN status IN ${COMPLETED_REPAYMENT_STATUS_SQL} THEN amount ELSE 0 END), 0) AS totalRepaid,
+        COALESCE(SUM(CASE WHEN status IN ${PENDING_REPAYMENT_STATUS_SQL} THEN 1 ELSE 0 END), 0) AS pendingRepayments
+      FROM repayments
     `);
     const [pendingLoanRequests] = await promisePool.query(`
       SELECT l.id, l.user_id, l.loan_type, l.amount, l.principal_amount, l.repayment_amount,
@@ -1403,9 +1603,9 @@ app.get('/api/admin/analytics', adminAuth, async (req, res) => {
     res.status(200).json({
       totalActiveUsers: Number(userStats.totalActiveUsers || 0),
       totalDisbursed: Number(loanStats.totalDisbursed || 0),
-      totalRepaid: Number(loanStats.totalRepaid || 0),
-      outstandingBalance: Number(loanStats.outstandingBalance || 0),
-      pendingRepayments: Number(loanStats.pendingRepayments || 0),
+      totalRepaid: Number(repaymentStats.totalRepaid || 0) + Number(loanStats.legacyRepaid || 0),
+      outstandingBalance: Number(loanStats.postedLoanBalance || 0) - Number(repaymentStats.totalRepaid || 0) - Number(loanStats.legacyRepaid || 0),
+      pendingRepayments: Number(repaymentStats.pendingRepayments || 0),
       pendingLoanRequests
     });
   } catch (error) {
@@ -1425,11 +1625,42 @@ app.get('/api/admin/loans', adminAuth, async (req, res) => {
              u.first_name, u.last_name, CONCAT_WS(' ', u.first_name, u.last_name) AS name, u.email, u.phone
       FROM loans l
       JOIN users u ON l.user_id = u.id
+      WHERE l.amount >= 0
+        AND COALESCE(l.transaction_type, '') <> 'Repayment'
       ORDER BY l.date_applied DESC
     `);
     res.status(200).json({ loans });
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch loans.' });
+  }
+});
+
+app.get('/api/admin/repayments', adminAuth, async (req, res) => {
+  try {
+    const [repayments] = await promisePool.query(`
+      SELECT r.id, r.user_id, r.loan_id, r.amount, r.payment_mode, r.account_number,
+             r.receipt_number, r.provider_request_id, r.checkout_request_id,
+             r.failure_reason, r.status, r.completed_at, r.created_at,
+             u.first_name, u.last_name, CONCAT_WS(' ', u.first_name, u.last_name) AS name, u.email, u.phone,
+             'Repayment' AS transaction_type
+      FROM repayments r
+      JOIN users u ON r.user_id = u.id
+      UNION ALL
+      SELECT l.id, l.user_id, NULL AS loan_id, ABS(l.amount) AS amount, l.payment_mode, l.account_number,
+             l.receipt_number, l.provider_request_id, l.checkout_request_id,
+             l.failure_reason, l.status, l.completed_at, l.date_applied AS created_at,
+             u.first_name, u.last_name, CONCAT_WS(' ', u.first_name, u.last_name) AS name, u.email, u.phone,
+             'Legacy Repayment' AS transaction_type
+      FROM loans l
+      JOIN users u ON l.user_id = u.id
+      WHERE l.amount < 0
+         OR COALESCE(l.transaction_type, '') = 'Repayment'
+      ORDER BY created_at DESC
+    `);
+    res.status(200).json({ repayments });
+  } catch (error) {
+    console.error('Admin repayments error:', error.message);
+    res.status(500).json({ message: 'Failed to fetch repayments.' });
   }
 });
 
@@ -1499,8 +1730,8 @@ app.post('/api/admin/loans/:loanId/decision', adminAuth, async (req, res) => {
     `, [loanId]);
 
     const [[balance]] = await promisePool.query(
-      `SELECT SUM(amount) AS total_balance FROM loans WHERE user_id = ? AND status IN ${POSTED_LEDGER_STATUS_SQL}`,
-      [loan.user_id]
+      USER_BALANCE_SQL,
+      [loan.user_id, loan.user_id, loan.user_id]
     );
 
     return res.status(200).json({
