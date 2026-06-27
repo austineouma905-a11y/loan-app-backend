@@ -155,6 +155,25 @@ const ensureColumn = async (table, column, definition, afterColumn) => {
   }
 };
 
+const ensureIndex = async (table, indexName, columnsSql) => {
+  try {
+    await promisePool.query(`ALTER TABLE ${table} ADD INDEX ${indexName} (${columnsSql})`);
+    console.log(`Index ${table}.${indexName} added successfully.`);
+    return true;
+  } catch (err) {
+    if (err.errno === 1061 || err.code === 'ER_DUP_KEYNAME') {
+      console.log(`Index ${table}.${indexName} verified.`);
+      return true;
+    }
+
+    setDatabaseState(err, false);
+    console.error(`Unexpected database index error for ${table}.${indexName}:`, err.message);
+    const hint = getDatabaseErrorHint(err);
+    if (hint) console.error(`Database hint: ${hint}`);
+    return false;
+  }
+};
+
 const ensureUsersColumns = async () => {
   const checks = [
     ['users', 'is_verified', 'TINYINT(1) NOT NULL DEFAULT 1', 'phone'],
@@ -224,7 +243,19 @@ const ensureExistingSchemaColumns = async () => {
   const usersReady = await ensureUsersColumns();
   const loansReady = await ensureLoansColumns();
   const repaymentsReady = await ensureRepaymentsColumns();
-  return usersReady && loansReady && repaymentsReady;
+  if (!usersReady || !loansReady || !repaymentsReady) return false;
+
+  const indexes = [
+    ['loans', 'idx_loans_user_status_date', 'user_id, status, date_applied'],
+    ['repayments', 'idx_repayments_user_status_date', 'user_id, status, created_at']
+  ];
+
+  for (const index of indexes) {
+    const ready = await ensureIndex(...index);
+    if (!ready) return false;
+  }
+
+  return true;
 };
 
 const cleanEnvValue = (value = '', removeWhitespace = false) => {
@@ -942,7 +973,7 @@ app.post('/api/signup', async (req, res) => {
 app.post('/api/login', (req, res) => {
   const email = normalizeEmail(req.body.email);
   const { password } = req.body;
-  const query = "SELECT id, first_name, last_name, email, phone, password, status, is_verified FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1";
+  const query = "SELECT id, first_name, last_name, email, phone, password, status, is_verified FROM users WHERE email = ? LIMIT 1";
   const adminUser = isAdminEmail(email);
 
   pool.query(query, [email], async (err, results) => {
